@@ -6,7 +6,8 @@
 3. 提供设置界面，用开关切换窗口模式和全屏模式。
 4. 渲染 9x9 棋盘，并根据关卡二维数组显示不同颜色的方向箭头。
 5. 部分箭头由 1 个三角形和 2-3 格长条身体组成，并规避格子重叠。
-6. 以 60FPS 运行完整主循环。
+6. 检测点击的箭头是否能飞出棋盘，并在控制台输出结果。
+7. 以 60FPS 运行完整主循环。
 """
 
 import math
@@ -239,10 +240,75 @@ class Game:
     def handle_game_events(self, event):
         """处理棋盘场景的事件。
 
-        这里不实现棋盘格点击逻辑和碰撞检测，只提供返回主菜单的快捷键。
+        鼠标左键用于检测箭头能否飞出，ESC 用于返回主菜单。
         """
         if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
             self.scene = "menu"
+        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            self.handle_board_click(event.pos)
+
+    def handle_board_click(self, mouse_pos):
+        """根据鼠标点击位置找到箭头，并在控制台打印路径检测结果。"""
+        cell = self.get_cell_from_mouse(mouse_pos)
+        if cell is None:
+            print("点击位置不在棋盘格子内")
+            return
+
+        row, col = cell
+        direction = self.level_data[row][col]
+        if direction == 0:
+            print(f"格子 ({row}, {col}) 为空，无箭头")
+            return
+
+        direction_names = {1: "上", 2: "下", 3: "左", 4: "右"}
+        if self.can_arrow_fly_out(row, col, direction):
+            print(f"格子 ({row}, {col})：{direction_names[direction]}方向箭头 -> 可飞出")
+        else:
+            print(f"格子 ({row}, {col})：{direction_names[direction]}方向箭头 -> 被阻挡")
+
+    def get_cell_from_mouse(self, mouse_pos):
+        """将鼠标像素坐标转换为棋盘格子坐标；点击到间隙时返回 None。"""
+        left, top = self.get_board_top_left()
+        local_x = mouse_pos[0] - left
+        local_y = mouse_pos[1] - top
+
+        step = self.CELL_SIZE + self.CELL_GAP
+        col = local_x // step
+        row = local_y // step
+
+        if not (0 <= row < self.BOARD_SIZE and 0 <= col < self.BOARD_SIZE):
+            return None
+
+        # 排除落在格子之间间隙上的点击
+        cell_local_x = col * step
+        cell_local_y = row * step
+        if local_x - cell_local_x >= self.CELL_SIZE or local_y - cell_local_y >= self.CELL_SIZE:
+            return None
+
+        return row, col
+
+    def can_arrow_fly_out(self, row, col, direction):
+        """检测指定位置的箭头是否可以被前方箭头阻挡。
+
+        从当前箭头的前一格开始，沿箭头方向逐格检查到棋盘边界：
+        - 途中遇到其他箭头，返回 False，表示被阻挡。
+        - 顺利到达棋盘外，返回 True，表示可以飞出并消除。
+        """
+        if direction not in self.DIRECTIONS:
+            return False
+
+        dr, dc = self.DIRECTIONS[direction]
+        check_row = row + dr
+        check_col = col + dc
+
+        # 只要还在棋盘内，就继续向前检查
+        while 0 <= check_row < self.BOARD_SIZE and 0 <= check_col < self.BOARD_SIZE:
+            if self.level_data[check_row][check_col] != 0:
+                return False
+            check_row += dr
+            check_col += dc
+
+        return True
 
     # ------------------------------------------------------------------
     # 主菜单按钮
@@ -664,7 +730,7 @@ class Game:
     # 更新与主循环
     # ------------------------------------------------------------------
     def update(self):
-        """更新游戏逻辑。当前棋盘仅静态渲染，不处理点击或碰撞。"""
+        """更新游戏逻辑。当前阶段只做路径检测，不做消除或动画。"""
         pass
 
     def run(self):
