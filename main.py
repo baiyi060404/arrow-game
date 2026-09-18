@@ -7,7 +7,8 @@
 4. 渲染 9x9 棋盘，并根据关卡二维数组显示不同颜色的方向箭头。
 5. 部分箭头由 1 个三角形和 2-3 格长条身体组成，并规避格子重叠。
 6. 检测点击的箭头是否能飞出棋盘，并在控制台输出结果。
-7. 以 60FPS 运行完整主循环。
+7. 播放飞出/阻挡动画，并显示关卡、剩余箭头和失误次数。
+8. 以 60FPS 运行完整主循环。
 """
 
 import math
@@ -35,6 +36,13 @@ class Game:
     # 箭头总数，以及其中使用 2-3 个正方形组成的长箭头占比
     TOTAL_ARROWS = 20
     LONG_ARROW_RATIO = 0.10
+    INITIAL_MISTAKES = 3
+
+    # 动画参数
+    FLY_DURATION = 0.45
+    SHAKE_DURATION = 0.70
+    SHAKE_AMPLITUDE = 8
+    BLOCKED_COLOR = (255, 80, 80)
 
     # 方向编码对应的行列偏移：1=上，2=下，3=左，4=右
     DIRECTIONS = {
@@ -84,6 +92,13 @@ class Game:
         self.scene = "menu"
         # 当前要渲染的关卡数据，生成时已规避长箭头之间的格子重叠
         self.level_data = self.generate_level()
+        self.current_level = 1
+        self.mistakes_left = self.INITIAL_MISTAKES
+        self.remaining_arrows = self.count_arrow_groups(self.level_data)
+
+        # 当前正在播放的箭头动画；同一时间只播放一个
+        self.flying_animation = None
+        self.shake_animation = None
 
         self.screen = pygame.display.set_mode(self.WINDOW_SIZE)
         pygame.display.set_caption(self.TITLE)
@@ -248,7 +263,12 @@ class Game:
             self.handle_board_click(event.pos)
 
     def handle_board_click(self, mouse_pos):
-        """根据鼠标点击位置找到箭头，并在控制台打印路径检测结果。"""
+        """根据鼠标点击位置检测箭头，并触发飞出或被阻挡动画。"""
+        # 动画播放期间不响应新的点击，避免多个动画互相干扰
+        if self.flying_animation is not None or self.shake_animation is not None:
+            print("动画播放中，请稍候")
+            return
+
         cell = self.get_cell_from_mouse(mouse_pos)
         if cell is None:
             print("点击位置不在棋盘格子内")
@@ -260,11 +280,20 @@ class Game:
             print(f"格子 ({row}, {col}) 为空，无箭头")
             return
 
+        # 长箭头可能占用多个格子，因此以完整箭头整体为单位处理，
+        # 并用箭头最前端的头部格子作为路径检测起点。
+        cells = self.collect_arrow_group(self.level_data, row, col)
+        head_row, head_col = cells[-1]
         direction_names = {1: "上", 2: "下", 3: "左", 4: "右"}
-        if self.can_arrow_fly_out(row, col, direction):
+
+        if self.can_arrow_fly_out(head_row, head_col, direction):
             print(f"格子 ({row}, {col})：{direction_names[direction]}方向箭头 -> 可飞出")
+            self.start_flying_animation(cells, direction)
         else:
             print(f"格子 ({row}, {col})：{direction_names[direction]}方向箭头 -> 被阻挡")
+            # 每次被阻挡扣 1 次失误，最低保持为 0
+            self.mistakes_left = max(0, self.mistakes_left - 1)
+            self.start_shake_animation(cells, direction)
 
     def get_cell_from_mouse(self, mouse_pos):
         """将鼠标像素坐标转换为棋盘格子坐标；点击到间隙时返回 None。"""
@@ -309,6 +338,40 @@ class Game:
             check_col += dc
 
         return True
+
+    def start_flying_animation(self, cells, direction):
+        """开始飞出动画；动画结束后再从数组中移除箭头。"""
+        self.flying_animation = {
+            "cells": list(cells),
+            "direction": direction,
+            "elapsed": 0.0,
+            "duration": self.FLY_DURATION,
+        }
+
+    def start_shake_animation(self, cells, direction):
+        """开始被阻挡时的左右晃动动画。"""
+        self.shake_animation = {
+            "cells": list(cells),
+            "direction": direction,
+            "elapsed": 0.0,
+            "duration": self.SHAKE_DURATION,
+        }
+
+    def count_arrow_groups(self, level_data):
+        """统计棋盘中的箭头组数量，长箭头按一个箭头计算。"""
+        visited = set()
+        count = 0
+
+        for row in range(self.BOARD_SIZE):
+            for col in range(self.BOARD_SIZE):
+                if not level_data[row][col] or (row, col) in visited:
+                    continue
+
+                cells = self.collect_arrow_group(level_data, row, col)
+                visited.update(cells)
+                count += 1
+
+        return count
 
     # ------------------------------------------------------------------
     # 主菜单按钮
@@ -482,14 +545,17 @@ class Game:
         knob_center = (knob_x, rect.centery)
         pygame.draw.circle(self.screen, self.SWITCH_KNOB_COLOR, knob_center, knob_radius)
 
-    def draw_arrow(self, surface, center, direction):
+    def draw_arrow(self, surface, center, direction, offset=(0, 0), color_override=None):
         """根据方向值在指定中心绘制三角形箭头。
 
         方向约定：1=上，2=下，3=左，4=右。
         """
-        x, y = center
+        x = center[0] + offset[0]
+        y = center[1] + offset[1]
         half = self.CELL_SIZE // 3
         color = self.ARROW_COLORS.get(direction, self.TEXT_COLOR)
+        if color_override is not None:
+            color = color_override
 
         if direction == 1:
             # 向上：顶点在上方
@@ -514,15 +580,30 @@ class Game:
         center_y = board_top + row * (self.CELL_SIZE + self.CELL_GAP) + self.CELL_SIZE // 2
         return center_x, center_y
 
-    def draw_continuous_arrow(self, surface, cells, direction, board_left, board_top):
+    def draw_continuous_arrow(
+        self,
+        surface,
+        cells,
+        direction,
+        board_left,
+        board_top,
+        offset=(0, 0),
+        color_override=None,
+    ):
         """将长箭头绘制成一个完整连续的多边形。
 
         长箭头的身体是覆盖多个格子的长条矩形；矩形宽度为三角形底边的一半，
         并且矩形的中轴线与三角形底边上的高重合。
         """
         color = self.ARROW_COLORS.get(direction, self.TEXT_COLOR)
+        if color_override is not None:
+            color = color_override
         tail_x, tail_y = self.get_cell_center(*cells[0], board_left, board_top)
         head_x, head_y = self.get_cell_center(*cells[-1], board_left, board_top)
+        tail_x += offset[0]
+        tail_y += offset[1]
+        head_x += offset[0]
+        head_y += offset[1]
         half = self.CELL_SIZE // 3
         # 长方形的宽为原身体宽度的一半，因此纵向偏移使用 half / 2
         body_half = half / 2
@@ -580,6 +661,37 @@ class Game:
 
         pygame.draw.polygon(surface, color, points)
 
+    def draw_arrow_group(
+        self,
+        surface,
+        cells,
+        direction,
+        board_left,
+        board_top,
+        offset=(0, 0),
+        color_override=None,
+    ):
+        """根据箭头占用的格子列表绘制单格或长条箭头。"""
+        if len(cells) == 1:
+            center = self.get_cell_center(*cells[0], board_left, board_top)
+            self.draw_arrow(
+                surface,
+                center,
+                direction,
+                offset=offset,
+                color_override=color_override,
+            )
+        else:
+            self.draw_continuous_arrow(
+                surface,
+                cells,
+                direction,
+                board_left,
+                board_top,
+                offset=offset,
+                color_override=color_override,
+            )
+
     def collect_arrow_group(self, level_data, row, col):
         """收集与指定格子相连、方向一致的完整箭头格子列表。"""
         direction = level_data[row][col]
@@ -622,9 +734,10 @@ class Game:
         top = (self.screen.get_height() - board_height) // 2 + 45
         return left, top
 
-    def draw_board(self, level_data):
+    def draw_board(self, level_data, skip_cells=None):
         """根据关卡二维数组渲染 9x9 棋盘和箭头。"""
         left, top = self.get_board_top_left()
+        skip_cells = skip_cells or set()
 
         # 先绘制所有格子的背景和边框
         for row in range(self.BOARD_SIZE):
@@ -642,23 +755,116 @@ class Game:
         for row in range(self.BOARD_SIZE):
             for col in range(self.BOARD_SIZE):
                 direction = level_data[row][col]
-                if not direction or (row, col) in visited:
+                if not direction or (row, col) in visited or (row, col) in skip_cells:
                     continue
 
                 cells = self.collect_arrow_group(level_data, row, col)
                 visited.update(cells)
+                self.draw_arrow_group(
+                    self.screen,
+                    cells,
+                    direction,
+                    left,
+                    top,
+                )
 
-                if len(cells) == 1:
-                    center = self.get_cell_center(row, col, left, top)
-                    self.draw_arrow(self.screen, center, direction)
-                else:
-                    self.draw_continuous_arrow(
-                        self.screen,
-                        cells,
-                        direction,
-                        left,
-                        top,
-                    )
+    def get_active_animation_cells(self):
+        """返回当前动画箭头占用的格子，用于避免重复绘制。"""
+        if self.flying_animation is not None:
+            return set(self.flying_animation["cells"])
+        if self.shake_animation is not None:
+            return set(self.shake_animation["cells"])
+        return set()
+
+    @staticmethod
+    def get_animation_progress(animation, eased=True):
+        """计算动画进度，范围限制在 0 到 1 之间。"""
+        progress = animation["elapsed"] / animation["duration"]
+        progress = max(0.0, min(1.0, progress))
+        if eased:
+            # 使用缓出曲线，让飞出动画在结尾更平滑
+            return 1 - (1 - progress) ** 2
+        return progress
+
+    def get_fly_offset(self, animation):
+        """根据飞出动画进度计算当前箭头的像素偏移量。"""
+        progress = self.get_animation_progress(animation, eased=True)
+        direction = animation["direction"]
+        cells = animation["cells"]
+        left, top = self.get_board_top_left()
+
+        board_width = self.BOARD_SIZE * self.CELL_SIZE + (self.BOARD_SIZE - 1) * self.CELL_GAP
+        board_height = self.BOARD_SIZE * self.CELL_SIZE + (self.BOARD_SIZE - 1) * self.CELL_GAP
+        margin = self.CELL_SIZE
+
+        # 用箭头最尾部的格子计算距离，确保整个箭头都移出棋盘
+        tail_x, tail_y = self.get_cell_center(*cells[0], left, top)
+
+        if direction == 4:
+            distance = left + board_width + margin - tail_x
+            return distance * progress, 0
+        if direction == 3:
+            distance = tail_x - (left - margin)
+            return -distance * progress, 0
+        if direction == 2:
+            distance = top + board_height + margin - tail_y
+            return 0, distance * progress
+        if direction == 1:
+            distance = tail_y - (top - margin)
+            return 0, -distance * progress
+        return 0, 0
+
+    def draw_flying_arrow(self):
+        """绘制正在向边界外移动的箭头。"""
+        animation = self.flying_animation
+        left, top = self.get_board_top_left()
+        offset = self.get_fly_offset(animation)
+        self.draw_arrow_group(
+            self.screen,
+            animation["cells"],
+            animation["direction"],
+            left,
+            top,
+            offset=offset,
+        )
+
+    def draw_shaking_arrow(self):
+        """绘制被阻挡时左右晃动并变红的箭头。"""
+        animation = self.shake_animation
+        progress = self.get_animation_progress(animation, eased=False)
+
+        # 左右晃动 2 次，即 sin 完成 2 个完整周期
+        shake_x = math.sin(progress * 4 * math.pi) * self.SHAKE_AMPLITUDE
+        left, top = self.get_board_top_left()
+        self.draw_arrow_group(
+            self.screen,
+            animation["cells"],
+            animation["direction"],
+            left,
+            top,
+            offset=(shake_x, 0),
+            color_override=self.BLOCKED_COLOR,
+        )
+
+    def draw_active_animation(self):
+        """根据当前动画状态绘制动画箭头。"""
+        if self.flying_animation is not None:
+            self.draw_flying_arrow()
+        elif self.shake_animation is not None:
+            self.draw_shaking_arrow()
+
+    def draw_hud(self):
+        """在左上角显示当前关卡、剩余箭头数和剩余失误次数。"""
+        lines = (
+            f"当前关卡：{self.current_level}",
+            f"剩余箭头：{self.remaining_arrows}",
+            f"剩余失误：{self.mistakes_left}",
+        )
+        x, y = 20, 18
+        for line in lines:
+            text_surface = self.subtitle_font.render(line, True, self.TEXT_COLOR)
+            self.screen.blit(text_surface, (x, y))
+            y += 30
 
     # ------------------------------------------------------------------
     # 场景绘制
@@ -705,6 +911,7 @@ class Game:
     def draw_game(self):
         """绘制棋盘场景，展示第 1 关的测试箭头数据。"""
         self.screen.fill(self.BG_COLOR)
+        self.draw_hud()
 
         title_center = (self.screen.get_width() // 2, 80)
         self.draw_text(self.screen, self.title_font, "第 1 关", self.TITLE_COLOR, title_center)
@@ -713,7 +920,9 @@ class Game:
         self.draw_text(self.screen, self.subtitle_font, "按 ESC 返回主菜单", self.MUTED_COLOR, hint_center)
 
         # 渲染棋盘和箭头
-        self.draw_board(self.level_data)
+        skip_cells = self.get_active_animation_cells()
+        self.draw_board(self.level_data, skip_cells=skip_cells)
+        self.draw_active_animation()
 
     def draw(self):
         """根据当前场景绘制整个画面。"""
@@ -729,17 +938,40 @@ class Game:
     # ------------------------------------------------------------------
     # 更新与主循环
     # ------------------------------------------------------------------
-    def update(self):
-        """更新游戏逻辑。当前阶段只做路径检测，不做消除或动画。"""
-        pass
+    def update_flying_animation(self, dt):
+        """推进飞出动画，并在箭头移出棋盘后从数组中移除。"""
+        animation = self.flying_animation
+        animation["elapsed"] += dt
+
+        if animation["elapsed"] >= animation["duration"]:
+            for row, col in animation["cells"]:
+                self.level_data[row][col] = 0
+
+            self.remaining_arrows = max(0, self.remaining_arrows - 1)
+            self.flying_animation = None
+
+    def update_shake_animation(self, dt):
+        """推进被阻挡时的晃动动画，结束后恢复箭头颜色。"""
+        animation = self.shake_animation
+        animation["elapsed"] += dt
+
+        if animation["elapsed"] >= animation["duration"]:
+            self.shake_animation = None
+
+    def update(self, dt):
+        """更新动画状态。"""
+        if self.flying_animation is not None:
+            self.update_flying_animation(dt)
+        if self.shake_animation is not None:
+            self.update_shake_animation(dt)
 
     def run(self):
         """运行游戏主循环，直到收到退出请求。"""
         while self.running:
-            # 限制帧率，使游戏稳定运行在 60FPS
-            self.clock.tick(self.FPS)
+            # 限制帧率，并把实际帧间隔传给动画更新，保证动画速度稳定
+            dt = self.clock.tick(self.FPS) / 1000.0
             self.handle_events()
-            self.update()
+            self.update(dt)
             self.draw()
 
         pygame.quit()
