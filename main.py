@@ -48,7 +48,8 @@ class Game:
     INITIAL_MISTAKES = 3
 
     # 动画参数
-    FLY_DURATION = 0.45
+    FLY_DURATION = 0.30
+    SNAKE_STEP_INTERVAL = 0.08
     SHAKE_DURATION = 0.70
     SHAKE_AMPLITUDE = 8
     BLOCKED_COLOR = (255, 80, 80)
@@ -583,17 +584,16 @@ class Game:
             if not arrow["cells"]:
                 continue
             if (row, col) in arrow["cells"]:
-                step_status = self.can_snake_arrow_step(index)
-
-                if step_status == "fly_out":
-                    self.start_snake_fly_animation(index)
-                elif step_status == "blocked":
+                if not self.can_snake_arrow_fly_out(index):
                     self.trigger_snake_blocked(index)
+                elif len(arrow["cells"]) == 1:
+                    # 单格箭头没有身体跟随，使用连续像素偏移飞出动画，避免瞬间消失。
+                    self.start_snake_fly_animation(index)
                 else:
                     self.snake_animation = {
                         "arrow_index": index,
                         "elapsed": 0.0,
-                        "step_interval": 0.18,
+                        "step_interval": self.SNAKE_STEP_INTERVAL,
                     }
                     print(f"箭头 {index + 1} 开始移动")
                 return
@@ -624,6 +624,29 @@ class Game:
 
         return "move"
 
+    def can_snake_arrow_fly_out(self, arrow_index):
+        """只读判断蛇形箭头从头部到棋盘边界之间是否全程无阻挡。
+
+        从 cells[0] 的头部开始，沿 direction 对应的 (dr, dc) 逐格检查。
+        途中只要 snake_grid 上有非 0 格子，就返回 False。
+        一路到棋盘外都没有障碍，才返回 True。
+        """
+        arrow = self.arrows[arrow_index]
+        direction = arrow["direction"]
+        dr, dc = self.DIRECTIONS[direction]
+
+        head_row, head_col = arrow["cells"][0]
+        check_row = head_row + dr
+        check_col = head_col + dc
+
+        while 0 <= check_row < self.BOARD_SIZE and 0 <= check_col < self.BOARD_SIZE:
+            if self.snake_grid[check_row][check_col] != 0:
+                return False
+            check_row += dr
+            check_col += dc
+
+        return True
+
     def step_snake_arrow(self, arrow_index):
         """让蛇形箭头前进一步。
 
@@ -632,10 +655,7 @@ class Game:
         arrow = self.arrows[arrow_index]
         step_status = self.can_snake_arrow_step(arrow_index)
 
-        # 下一步越界或受阻时，先触发对应的飞出/碰撞反馈，不移动原箭头
-        if step_status == "fly_out":
-            self.start_snake_fly_animation(arrow_index)
-            return False
+        # 下一步被阻挡时，先触发碰撞反馈，不移动原箭头
         if step_status == "blocked":
             self.trigger_snake_blocked(arrow_index)
             return False
@@ -662,9 +682,20 @@ class Game:
             new_cells.append(old_cells[index - 1])
 
         # 更新占用网格：旧尾巴让出，新头部占入。
+        # 如果新头部已经越界，则只清除旧尾巴，不写入 outside_head。
         self.snake_grid[old_tail[0]][old_tail[1]] = 0
-        self.snake_grid[new_row][new_col] = arrow_id
+        if 0 <= new_row < self.BOARD_SIZE and 0 <= new_col < self.BOARD_SIZE:
+            self.snake_grid[new_row][new_col] = arrow_id
+
         arrow["cells"] = new_cells
+
+        # 当所有身体段都已经移出棋盘后，再正式移除箭头。
+        if all(
+            not (0 <= cell[0] < self.BOARD_SIZE and 0 <= cell[1] < self.BOARD_SIZE)
+            for cell in new_cells
+        ):
+            self.remove_snake_arrow(arrow_index)
+
         return True
 
     def is_arrow_straight(self, arrow):
@@ -685,7 +716,9 @@ class Game:
         """移除一条已经飞出边界的蛇形箭头。"""
         arrow = self.arrows[arrow_index]
         for row, col in arrow["cells"]:
-            self.snake_grid[row][col] = 0
+            # 部分身体段可能已经移动到棋盘外，不能继续索引 snake_grid。
+            if 0 <= row < self.BOARD_SIZE and 0 <= col < self.BOARD_SIZE:
+                self.snake_grid[row][col] = 0
 
         arrow["cells"] = []
         self.remaining_arrows = max(0, self.remaining_arrows - 1)
@@ -1394,6 +1427,17 @@ class Game:
             for point in ordered_points
         ]
         head_center = ordered_points[0]
+
+        # 单格箭头直接使用第一关的“三角形 + 长方形箭身”样式。
+        if len(cells) == 1:
+            self.draw_arrow(
+                self.screen,
+                head_center,
+                direction,
+                color_override=color,
+            )
+            return
+
         dr, dc = self.DIRECTIONS[direction]
 
         # 身体折线起点不是头部中心，而是头部三角形底边，避免身体插入三角形内部。
