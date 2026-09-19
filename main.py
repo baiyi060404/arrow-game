@@ -5,7 +5,7 @@
 2. 显示主菜单、选关界面和三个可通关的 9x9/11x11/13x13 关卡。
 3. 提供设置界面，用开关切换窗口模式和全屏模式。
 4. 渲染 9x9 棋盘，并根据关卡二维数组显示不同颜色的方向箭头。
-5. 部分箭头由 1 个三角形和 2-3 格长条身体组成，并规避格子重叠与无法通关的死局。
+5. 第一关使用直线箭头；第二、三关使用可弯折的蛇形多段箭头。
 6. 检测点击的箭头是否能飞出棋盘，并在控制台输出结果。
 7. 播放飞出/阻挡动画，显示关卡、剩余箭头，并在扣除机会时播放爱心碎裂特效。
 8. 清除全部箭头后进入通关界面，机会耗尽后进入失败界面。
@@ -108,6 +108,7 @@ class Game:
         # 当前正在播放的箭头动画；同一时间只播放一个
         self.flying_animation = None
         self.shake_animation = None
+        self.snake_flying_animation = None
         # 爱心扣除时产生的碎裂粒子
         self.heart_particles = []
 
@@ -134,12 +135,176 @@ class Game:
         self.CELL_SIZE = config["cell_size"]
         self.TOTAL_ARROWS = config["total_arrows"]
 
-        self.level_data = self.generate_level()
+        self.use_snake_movement = level_number > 1
+
+        if self.use_snake_movement:
+            # 第二、三关使用可弯折的多段箭头
+            self.arrows = self.generate_snake_level()
+            self.level_data = [[0 for _ in range(self.BOARD_SIZE)] for _ in range(self.BOARD_SIZE)]
+            self.remaining_arrows = len(self.arrows)
+            self.snake_animation = None
+            self.snake_flying_animation = None
+        else:
+            # 第一关保持原来的直线箭头生成方式
+            self.level_data = self.generate_level()
+            self.arrows = None
+            self.snake_grid = None
+            self.snake_animation = None
+            self.snake_flying_animation = None
+            self.remaining_arrows = self.count_arrow_groups(self.level_data)
+
         self.mistakes_left = self.INITIAL_MISTAKES
-        self.remaining_arrows = self.count_arrow_groups(self.level_data)
         self.flying_animation = None
         self.shake_animation = None
         self.heart_particles = []
+
+    def generate_snake_level(self):
+        """生成第二、三关使用的可弯折多段箭头。"""
+        for attempt in range(200):
+            rng = random.Random(20260919 + self.current_level * 100 + attempt)
+            arrows, grid = self.try_build_snake_level(rng)
+            if arrows is not None:
+                self.snake_grid = grid
+                return arrows
+        raise RuntimeError("无法生成可弯折箭头关卡")
+
+    def try_build_snake_level(self, rng):
+        """尝试生成一组不重叠的可弯折箭头。"""
+        size = self.BOARD_SIZE
+        grid = [[0 for _ in range(size)] for _ in range(size)]
+        occupied = set()
+        arrows = []
+
+        multi_count = round(self.TOTAL_ARROWS * 0.80)
+        single_count = self.TOTAL_ARROWS - multi_count
+        one_bend_count = round(multi_count * 0.80)
+        multi_bend_count = multi_count - one_bend_count
+
+        # 单格箭头
+        for _ in range(single_count):
+            if len(occupied) >= size * size:
+                return None, None
+            row, col = rng.choice(tuple(set(
+                (r, c)
+                for r in range(size)
+                for c in range(size)
+                if (r, c) not in occupied
+            )))
+            direction = rng.choice([1, 2, 3, 4])
+            occupied.add((row, col))
+            grid[row][col] = len(arrows) + 1
+            arrows.append({"cells": [(row, col)], "direction": direction})
+
+        # 一次弯折的多格箭头
+        for _ in range(one_bend_count):
+            path = self.generate_bent_path(occupied, rng, min_bends=1, max_bends=1)
+            if path is None:
+                return None, None
+            self.register_snake_arrow(path, occupied, grid, arrows)
+
+        # 二次及以上弯折的多格箭头
+        for _ in range(multi_bend_count):
+            path = self.generate_bent_path(occupied, rng, min_bends=2, max_bends=5)
+            if path is None:
+                return None, None
+            self.register_snake_arrow(path, occupied, grid, arrows)
+
+        return arrows, grid
+
+    def register_snake_arrow(self, tail_to_head_path, occupied, grid, arrows):
+        """将生成好的路径转换为头到尾顺序，并写入占用网格。"""
+        cells = list(reversed(tail_to_head_path))
+        arrow_id = len(arrows) + 1
+
+        for row, col in cells:
+            occupied.add((row, col))
+            grid[row][col] = arrow_id
+
+        if len(cells) == 1:
+            direction = 1
+        else:
+            direction = self.direction_between(cells[1], cells[0])
+
+        arrows.append({"cells": cells, "direction": direction})
+
+    def generate_bent_path(self, occupied, rng, min_bends, max_bends):
+        """随机生成一条长度至少为 3 且满足弯折次数要求的路径。"""
+        size = self.BOARD_SIZE
+        for _ in range(800):
+            empty_cells = [
+                (row, col)
+                for row in range(size)
+                for col in range(size)
+                if (row, col) not in occupied
+            ]
+            if not empty_cells:
+                return None
+
+            target_length = rng.randint(3, min(6, size))
+            start_row, start_col = rng.choice(empty_cells)
+            path = [(start_row, start_col)]
+            previous_direction = None
+            bends = 0
+
+            while len(path) < target_length:
+                directions = [1, 2, 3, 4]
+                rng.shuffle(directions)
+                placed = False
+
+                for direction in directions:
+                    dr, dc = self.DIRECTIONS[direction]
+                    next_row = path[-1][0] + dr
+                    next_col = path[-1][1] + dc
+
+                    if not (
+                        0 <= next_row < size
+                        and 0 <= next_col < size
+                        and (next_row, next_col) not in occupied
+                        and (next_row, next_col) not in path
+                    ):
+                        continue
+
+                    if previous_direction is not None and direction == self.opposite_direction(previous_direction):
+                        continue
+
+                    new_bends = bends
+                    if previous_direction is not None and direction != previous_direction:
+                        new_bends += 1
+
+                    if new_bends > max_bends:
+                        continue
+
+                    remaining = target_length - len(path) - 1
+                    if new_bends + remaining < min_bends:
+                        continue
+
+                    path.append((next_row, next_col))
+                    previous_direction = direction
+                    bends = new_bends
+                    placed = True
+                    break
+
+                if not placed:
+                    break
+
+            if len(path) == target_length and min_bends <= bends <= max_bends:
+                return path
+
+        return None
+
+    @staticmethod
+    def opposite_direction(direction):
+        """返回相反方向。"""
+        return {1: 2, 2: 1, 3: 4, 4: 3}[direction]
+
+    def direction_between(self, from_cell, to_cell):
+        """返回从一个格子到相邻格子的方向编码。"""
+        dr = to_cell[0] - from_cell[0]
+        dc = to_cell[1] - from_cell[1]
+        for direction, (expected_dr, expected_dc) in self.DIRECTIONS.items():
+            if (dr, dc) == (expected_dr, expected_dc):
+                return direction
+        return 1
 
     def generate_level(self, base_seed=20260918):
         """生成一个保证可以按某种顺序全部消除的 9x9 关卡。
@@ -355,6 +520,10 @@ class Game:
 
     def handle_board_click(self, mouse_pos):
         """根据鼠标点击位置检测箭头，并触发飞出或被阻挡动画。"""
+        if self.use_snake_movement:
+            self.handle_snake_board_click(mouse_pos)
+            return
+
         # 动画播放期间不响应新的点击，避免多个动画互相干扰
         if self.flying_animation is not None or self.shake_animation is not None:
             print("动画播放中，请稍候")
@@ -388,6 +557,167 @@ class Game:
             # 每次被阻挡扣 1 次失误，最低保持为 0
             self.mistakes_left = max(0, self.mistakes_left - 1)
             self.start_shake_animation(cells, direction)
+
+    def handle_snake_board_click(self, mouse_pos):
+        """处理第二、三关的蛇形箭头发射。"""
+        if (
+            self.snake_animation is not None
+            or self.snake_flying_animation is not None
+            or self.shake_animation is not None
+        ):
+            print("箭头移动中，请稍候")
+            return
+
+        cell = self.get_cell_from_mouse(mouse_pos)
+        if cell is None:
+            print("点击位置不在棋盘格子内")
+            return
+
+        row, col = cell
+        if self.snake_grid[row][col] == 0:
+            print(f"格子 ({row}, {col}) 为空，无箭头")
+            return
+
+        # 找到被点击的箭头
+        for index, arrow in enumerate(self.arrows):
+            if not arrow["cells"]:
+                continue
+            if (row, col) in arrow["cells"]:
+                step_status = self.can_snake_arrow_step(index)
+
+                if step_status == "fly_out":
+                    self.start_snake_fly_animation(index)
+                elif step_status == "blocked":
+                    self.trigger_snake_blocked(index)
+                else:
+                    self.snake_animation = {
+                        "arrow_index": index,
+                        "elapsed": 0.0,
+                        "step_interval": 0.18,
+                    }
+                    print(f"箭头 {index + 1} 开始移动")
+                return
+
+    def can_snake_arrow_step(self, arrow_index):
+        """只读判断蛇形箭头下一步的状态，不修改 cells 和 snake_grid。
+
+        返回：
+        - "fly_out"：下一步越界，可以飞出棋盘
+        - "blocked"：下一步会被其他箭头阻挡
+        - "move"：下一步可以正常移动
+        """
+        arrow = self.arrows[arrow_index]
+        cells = arrow["cells"]
+        direction = arrow["direction"]
+        dr, dc = self.DIRECTIONS[direction]
+
+        head_row, head_col = cells[0]
+        next_row = head_row + dr
+        next_col = head_col + dc
+
+        if not (0 <= next_row < self.BOARD_SIZE and 0 <= next_col < self.BOARD_SIZE):
+            return "fly_out"
+
+        next_grid_id = self.snake_grid[next_row][next_col]
+        if next_grid_id != 0 and (next_row, next_col) != cells[-1]:
+            return "blocked"
+
+        return "move"
+
+    def step_snake_arrow(self, arrow_index):
+        """让蛇形箭头前进一步。
+
+        返回 True 表示本次移动完成；越界飞出或被阻挡时会启动对应动画并返回 False。
+        """
+        arrow = self.arrows[arrow_index]
+        step_status = self.can_snake_arrow_step(arrow_index)
+
+        # 下一步越界或受阻时，先触发对应的飞出/碰撞反馈，不移动原箭头
+        if step_status == "fly_out":
+            self.start_snake_fly_animation(arrow_index)
+            return False
+        if step_status == "blocked":
+            self.trigger_snake_blocked(arrow_index)
+            return False
+
+        # cells[0] 是头部，后面依次是身体各段
+        # 必须先完整备份旧坐标，不能边遍历边修改原数组
+        old_cells = arrow["cells"].copy()
+        direction = arrow["direction"]
+        dr, dc = self.DIRECTIONS[direction]
+
+        # 1. 先保存上一帧头部坐标，供身体段依次跟随
+        old_head = old_cells[0]
+
+        # 2. 预判头部下一格
+        new_head = (old_head[0] + dr, old_head[1] + dc)
+        new_row, new_col = new_head
+
+        arrow_id = arrow_index + 1
+        old_tail = old_cells[-1]
+
+        # 蛇式移动：新头部插到最前，身体段使用旧坐标，去掉旧尾巴。
+        new_cells = [new_head]
+        for index in range(1, len(old_cells)):
+            new_cells.append(old_cells[index - 1])
+
+        # 更新占用网格：旧尾巴让出，新头部占入。
+        self.snake_grid[old_tail[0]][old_tail[1]] = 0
+        self.snake_grid[new_row][new_col] = arrow_id
+        arrow["cells"] = new_cells
+        return True
+
+    def is_arrow_straight(self, arrow):
+        """判断蛇形箭头是否已经变成一条完整直线。"""
+        cells = arrow["cells"]
+        if len(cells) <= 2:
+            return True
+
+        dr, dc = self.DIRECTIONS[arrow["direction"]]
+        for index in range(len(cells) - 1):
+            current = cells[index]
+            next_cell = cells[index + 1]
+            if (current[0] - next_cell[0], current[1] - next_cell[1]) != (dr, dc):
+                return False
+        return True
+
+    def remove_snake_arrow(self, arrow_index):
+        """移除一条已经飞出边界的蛇形箭头。"""
+        arrow = self.arrows[arrow_index]
+        for row, col in arrow["cells"]:
+            self.snake_grid[row][col] = 0
+
+        arrow["cells"] = []
+        self.remaining_arrows = max(0, self.remaining_arrows - 1)
+
+        if self.remaining_arrows == 0 and self.scene == "game":
+            self.scene = "win"
+
+    def trigger_snake_blocked(self, arrow_index):
+        """蛇形箭头被阻挡时触发爱心扣减和红色晃动反馈，但不移动箭头。"""
+        arrow = self.arrows[arrow_index]
+
+        if self.mistakes_left > 0:
+            self.spawn_heart_break(self.mistakes_left - 1)
+        self.mistakes_left = max(0, self.mistakes_left - 1)
+
+        self.shake_animation = {
+            "cells": list(arrow["cells"]),
+            "direction": arrow["direction"],
+            "elapsed": 0.0,
+            "duration": self.SHAKE_DURATION,
+            "snake": True,
+        }
+
+    def start_snake_fly_animation(self, arrow_index):
+        """开始蛇形箭头的连续飞出动画，动画结束后才从网格移除。"""
+        arrow = self.arrows[arrow_index]
+        self.snake_flying_animation = {
+            "arrow_index": arrow_index,
+            "direction": arrow["direction"],
+            "elapsed": 0.0,
+            "duration": self.FLY_DURATION,
+        }
 
     def get_cell_from_mouse(self, mouse_pos):
         """将鼠标像素坐标转换为棋盘格子坐标；点击到间隙时返回 None。"""
@@ -1015,12 +1345,100 @@ class Game:
                     top,
                 )
 
+    def draw_snake_board(self, skip_cells=None):
+        """绘制第二、三关的可弯折多段箭头。"""
+        left, top = self.get_board_top_left()
+        skip_cells = skip_cells or set()
+
+        # 绘制棋盘格背景
+        for row in range(self.BOARD_SIZE):
+            for col in range(self.BOARD_SIZE):
+                cell_x = left + col * (self.CELL_SIZE + self.CELL_GAP)
+                cell_y = top + row * (self.CELL_SIZE + self.CELL_GAP)
+                cell_rect = pygame.Rect(cell_x, cell_y, self.CELL_SIZE, self.CELL_SIZE)
+                pygame.draw.rect(self.screen, self.BOARD_CELL_COLOR, cell_rect)
+                pygame.draw.rect(self.screen, self.BOARD_GRID_COLOR, cell_rect, width=2)
+
+        for arrow in self.arrows:
+            if not arrow["cells"]:
+                continue
+            if any(cell in skip_cells for cell in arrow["cells"]):
+                continue
+            self.draw_snake_arrow(arrow, left, top)
+
+    def draw_snake_arrow(
+        self,
+        arrow,
+        board_left,
+        board_top,
+        offset=(0, 0),
+        color_override=None,
+    ):
+        """绘制一个可弯折的蛇形箭头。"""
+        # cells 必须保持有序：cells[0] 是头部，后续为身体段。
+        cells = arrow["cells"]
+        direction = arrow["direction"]
+        color = self.ARROW_COLORS.get(direction, self.TEXT_COLOR)
+        if color_override is not None:
+            color = color_override
+        half = self.CELL_SIZE // 3
+        body_width = max(2, int(half))
+
+        # 先按顺序取得所有格子中心，保证画出来的折线首尾相连。
+        ordered_points = [
+            self.get_cell_center(*cell, board_left, board_top)
+            for cell in cells
+        ]
+        ordered_points = [
+            (point[0] + offset[0], point[1] + offset[1])
+            for point in ordered_points
+        ]
+        head_center = ordered_points[0]
+        dr, dc = self.DIRECTIONS[direction]
+
+        # 身体折线起点不是头部中心，而是头部三角形底边，避免身体插入三角形内部。
+        body_start = (
+            head_center[0] - dc * half,
+            head_center[1] - dr * half,
+        )
+        body_points = [body_start] + ordered_points[1:]
+
+        # 按顺序连接：底边 -> 第 2 段 -> 第 3 段 -> ... -> 尾巴。
+        for index in range(len(body_points) - 1):
+            pygame.draw.line(
+                self.screen,
+                color,
+                body_points[index],
+                body_points[index + 1],
+                body_width,
+            )
+
+        # 在身体段的连接点补圆，保证拐弯处连续、无缺口。
+        for point in body_points[1:]:
+            pygame.draw.circle(self.screen, color, point, max(1, body_width // 2))
+
+        # 头部单独绘制三角形，指向当前移动方向。
+        x, y = head_center
+        if direction == 1:
+            points = ((x, y - half), (x - half, y + half), (x + half, y + half))
+        elif direction == 2:
+            points = ((x, y + half), (x - half, y - half), (x + half, y - half))
+        elif direction == 3:
+            points = ((x - half, y), (x + half, y - half), (x + half, y + half))
+        else:
+            points = ((x + half, y), (x - half, y - half), (x - half, y + half))
+
+        pygame.draw.polygon(self.screen, color, points)
+
     def get_active_animation_cells(self):
         """返回当前动画箭头占用的格子，用于避免重复绘制。"""
         if self.flying_animation is not None:
             return set(self.flying_animation["cells"])
         if self.shake_animation is not None:
             return set(self.shake_animation["cells"])
+        if self.snake_flying_animation is not None:
+            arrow_index = self.snake_flying_animation["arrow_index"]
+            return set(self.arrows[arrow_index]["cells"])
         return set()
 
     @staticmethod
@@ -1075,6 +1493,43 @@ class Game:
             offset=offset,
         )
 
+    def get_snake_fly_offset(self):
+        """计算蛇形箭头飞出动画的像素偏移量。"""
+        animation = self.snake_flying_animation
+        progress = self.get_animation_progress(animation, eased=True)
+        direction = animation["direction"]
+        cells = self.arrows[animation["arrow_index"]]["cells"]
+        left, top = self.get_board_top_left()
+
+        board_width = self.BOARD_SIZE * self.CELL_SIZE + (self.BOARD_SIZE - 1) * self.CELL_GAP
+        board_height = self.BOARD_SIZE * self.CELL_SIZE + (self.BOARD_SIZE - 1) * self.CELL_GAP
+        margin = self.CELL_SIZE
+
+        # cells[-1] 是蛇形箭头的尾巴，使用它确保整条箭头都移出棋盘。
+        tail_x, tail_y = self.get_cell_center(*cells[-1], left, top)
+
+        if direction == 4:
+            distance = left + board_width + margin - tail_x
+            return distance * progress, 0
+        if direction == 3:
+            distance = tail_x - (left - margin)
+            return -distance * progress, 0
+        if direction == 2:
+            distance = top + board_height + margin - tail_y
+            return 0, distance * progress
+        if direction == 1:
+            distance = tail_y - (top - margin)
+            return 0, -distance * progress
+        return 0, 0
+
+    def draw_snake_flying_arrow(self):
+        """绘制正在飞出的蛇形箭头。"""
+        animation = self.snake_flying_animation
+        arrow = self.arrows[animation["arrow_index"]]
+        left, top = self.get_board_top_left()
+        offset = self.get_snake_fly_offset()
+        self.draw_snake_arrow(arrow, left, top, offset=offset)
+
     def draw_shaking_arrow(self):
         """绘制被阻挡时左右晃动并变红的箭头。"""
         animation = self.shake_animation
@@ -1083,20 +1538,36 @@ class Game:
         # 左右晃动 2 次，即 sin 完成 2 个完整周期
         shake_x = math.sin(progress * 4 * math.pi) * self.SHAKE_AMPLITUDE
         left, top = self.get_board_top_left()
-        self.draw_arrow_group(
-            self.screen,
-            animation["cells"],
-            animation["direction"],
-            left,
-            top,
-            offset=(shake_x, 0),
-            color_override=self.BLOCKED_COLOR,
-        )
+
+        if animation.get("snake"):
+            arrow = {
+                "cells": animation["cells"],
+                "direction": animation["direction"],
+            }
+            self.draw_snake_arrow(
+                arrow,
+                left,
+                top,
+                offset=(shake_x, 0),
+                color_override=self.BLOCKED_COLOR,
+            )
+        else:
+            self.draw_arrow_group(
+                self.screen,
+                animation["cells"],
+                animation["direction"],
+                left,
+                top,
+                offset=(shake_x, 0),
+                color_override=self.BLOCKED_COLOR,
+            )
 
     def draw_active_animation(self):
         """根据当前动画状态绘制动画箭头。"""
         if self.flying_animation is not None:
             self.draw_flying_arrow()
+        elif self.snake_flying_animation is not None:
+            self.draw_snake_flying_arrow()
         elif self.shake_animation is not None:
             self.draw_shaking_arrow()
 
@@ -1349,7 +1820,11 @@ class Game:
 
         # 渲染棋盘和箭头
         skip_cells = self.get_active_animation_cells()
-        self.draw_board(self.level_data, skip_cells=skip_cells)
+        if self.use_snake_movement:
+            self.draw_snake_board(skip_cells=skip_cells)
+        else:
+            self.draw_board(self.level_data, skip_cells=skip_cells)
+
         self.draw_active_animation()
 
     def draw(self):
@@ -1410,12 +1885,48 @@ class Game:
             particle["x"] += particle["vx"] * dt
             particle["y"] += particle["vy"] * dt
 
+    def update_snake_animation(self, dt):
+        """推进蛇形箭头的逐步移动动画。"""
+        if self.snake_animation is None:
+            return
+
+        animation = self.snake_animation
+        animation["elapsed"] += dt
+
+        while animation["elapsed"] >= animation["step_interval"]:
+            animation["elapsed"] -= animation["step_interval"]
+            moved = self.step_snake_arrow(animation["arrow_index"])
+            arrow_index = animation["arrow_index"]
+
+            # 碰撞阻挡，或箭头已经飞出并被移除时，都要结束本次动画
+            if not moved or not self.arrows[arrow_index]["cells"]:
+                self.snake_animation = None
+                break
+
+    def update_snake_flying_animation(self, dt):
+        """推进蛇形箭头的飞出动画，动画结束后再清除箭头。"""
+        if self.snake_flying_animation is None:
+            return
+
+        animation = self.snake_flying_animation
+        animation["elapsed"] += dt
+
+        if animation["elapsed"] >= animation["duration"]:
+            self.remove_snake_arrow(animation["arrow_index"])
+            self.snake_flying_animation = None
+
     def update(self, dt):
         """更新动画状态。"""
-        if self.flying_animation is not None:
-            self.update_flying_animation(dt)
-        if self.shake_animation is not None:
-            self.update_shake_animation(dt)
+        if self.use_snake_movement:
+            self.update_snake_animation(dt)
+            self.update_snake_flying_animation(dt)
+            if self.shake_animation is not None:
+                self.update_shake_animation(dt)
+        else:
+            if self.flying_animation is not None:
+                self.update_flying_animation(dt)
+            if self.shake_animation is not None:
+                self.update_shake_animation(dt)
         self.update_heart_particles(dt)
 
     def run(self):
