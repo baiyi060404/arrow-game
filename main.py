@@ -1,4 +1,4 @@
-"""touhou-arrow game 开始界面与基础窗口模块。
+"""arrow-game 开始界面与基础窗口模块。
 
 本文件负责：
 1. 创建 800x600 的游戏窗口，并支持窗口/全屏模式切换。
@@ -14,6 +14,7 @@
 """
 
 import copy
+from array import array
 import math
 import random
 import sys
@@ -27,7 +28,7 @@ class Game:
     # 窗口模式下的显示尺寸
     WINDOW_SIZE = (800, 600)
     # 游戏窗口标题
-    TITLE = "touhou-arrow game"
+    TITLE = "arrow-game"
     # 目标帧率
     FPS = 60
 
@@ -96,6 +97,7 @@ class Game:
     def __init__(self):
         """初始化 Pygame、字体、时钟与初始窗口。"""
         pygame.init()
+        self.init_sounds()
 
         self.clock = pygame.time.Clock()
         self.running = True
@@ -116,6 +118,10 @@ class Game:
         self.snake_flying_animation = None
         # 爱心扣除时产生的碎裂粒子
         self.heart_particles = []
+        # 得分、计时与无尽模式状态
+        self.score = 0
+        self.elapsed_time = 0.0
+        self.endless_mode = False
 
         self.screen = pygame.display.set_mode(self.WINDOW_SIZE)
         pygame.display.set_caption(self.TITLE)
@@ -126,11 +132,48 @@ class Game:
         self.button_font = self._load_font(28)
         self.setting_font = self._load_font(30)
 
+        # 提前生成第三关，后续选择第三关时直接使用缓存。
+        self.preload_third_level()
+
     @staticmethod
     def _load_font(size):
         """创建指定大小的中文字体对象。"""
         font_names = ["microsoftyahei", "msyh", "simhei", "simsun"]
         return pygame.font.SysFont(font_names, size)
+
+    def init_sounds(self):
+        """初始化简单音效；音频设备不可用时静默降级。"""
+        self.sound_error = None
+        self.sound_success = None
+        self.sound_ok = False
+
+        try:
+            pygame.mixer.init(22050, -16, 1, 512)
+            self.sound_error = self._make_tone(160, 0.12, 0.25)
+            self.sound_success = self._make_tone(880, 0.12, 0.20)
+            self.sound_ok = True
+        except Exception:
+            self.sound_ok = False
+
+    @staticmethod
+    def _make_tone(frequency, duration, volume):
+        """生成一个简单的正弦波音效。"""
+        sample_rate = 22050
+        sample_count = int(sample_rate * duration)
+        samples = array("h")
+        for index in range(sample_count):
+            value = int(
+                math.sin(2 * math.pi * frequency * index / sample_rate)
+                * volume
+                * 32767
+            )
+            samples.append(value)
+        return pygame.mixer.Sound(buffer=samples.tobytes())
+
+    def play_sound(self, sound):
+        """播放音效，音频不可用时直接忽略。"""
+        if self.sound_ok and sound is not None:
+            sound.play()
 
     def apply_level_config(self, level_number):
         """按关卡编号设置棋盘尺寸、格子大小和箭头数量，并生成关卡。"""
@@ -163,6 +206,7 @@ class Game:
                 }
             else:
                 # 第一关保持原来的直线箭头生成方式
+                self.LONG_ARROW_RATIO = 0.0
                 self.level_data = self.generate_level()
                 self.arrows = None
                 self.snake_grid = None
@@ -180,6 +224,27 @@ class Game:
         self.snake_animation = None
         self.snake_flying_animation = None
         self.heart_particles = []
+
+    def preload_third_level(self):
+        """提前生成第三关并写入缓存，避免首次点击第三关时阻塞。"""
+        if 3 in self.level_cache:
+            return
+
+        config = self.LEVELS[3]
+        self.current_level = 3
+        self.BOARD_SIZE = config["size"]
+        self.CELL_SIZE = config["cell_size"]
+        self.TOTAL_ARROWS = config["total_arrows"]
+        self.use_snake_movement = True
+
+        arrows = self.generate_snake_level()
+        self.level_cache[3] = {
+            "arrows": copy.deepcopy(arrows),
+            "snake_grid": copy.deepcopy(self.snake_grid),
+        }
+
+        # 恢复初始第一关状态，避免预生成影响启动界面。
+        self.apply_level_config(1)
 
     def generate_snake_level(self):
         """生成第二、三关使用的可弯折多段箭头。"""
@@ -201,12 +266,19 @@ class Game:
             for row in range(size)
             for col in range(size)
         }
+        empty_cells_list = list(empty_cells)
         arrows = []
 
         multi_count = round(self.TOTAL_ARROWS * 0.80)
         single_count = self.TOTAL_ARROWS - multi_count
-        one_bend_count = round(multi_count * 0.80)
-        multi_bend_count = multi_count - one_bend_count
+        if self.current_level == 3 or self.endless_mode:
+            # 第三关将两弯折及以上的多格箭头占比提高到约 50%。
+            one_bend_count = multi_count // 2
+            multi_bend_count = multi_count - one_bend_count
+        else:
+            # 第二关仍保持：多格箭头中 80% 一次弯折，20% 多次弯折。
+            one_bend_count = round(multi_count * 0.80)
+            multi_bend_count = multi_count - one_bend_count
         single_attempts = 300 if size >= 13 else 150
         one_bend_attempts = 500 if size >= 13 else 250
         multi_bend_attempts = 700 if size >= 13 else 350
@@ -218,12 +290,19 @@ class Game:
                 if not empty_cells:
                     return None, None
 
-                row, col = rng.choice(tuple(empty_cells))
+                row, col = rng.choice(empty_cells_list)
                 direction = rng.choice([1, 2, 3, 4])
                 candidate = {"cells": [(row, col)], "direction": direction}
 
                 if self.is_snake_arrow_path_clear(candidate, grid):
-                    self.commit_snake_arrow(candidate, occupied, empty_cells, grid, arrows)
+                    self.commit_snake_arrow(
+                        candidate,
+                        occupied,
+                        empty_cells,
+                        empty_cells_list,
+                        grid,
+                        arrows,
+                    )
                     placed = True
                     break
 
@@ -234,13 +313,26 @@ class Game:
         for _ in range(one_bend_count):
             placed = False
             for _ in range(one_bend_attempts):
-                path = self.generate_bent_path(empty_cells, rng, min_bends=1, max_bends=1)
+                path = self.generate_bent_path(
+                    empty_cells,
+                    empty_cells_list,
+                    rng,
+                    min_bends=1,
+                    max_bends=1,
+                )
                 if path is None:
                     continue
 
                 candidate = self.make_snake_arrow_candidate(path)
                 if self.is_snake_arrow_path_clear(candidate, grid):
-                    self.commit_snake_arrow(candidate, occupied, empty_cells, grid, arrows)
+                    self.commit_snake_arrow(
+                        candidate,
+                        occupied,
+                        empty_cells,
+                        empty_cells_list,
+                        grid,
+                        arrows,
+                    )
                     placed = True
                     break
 
@@ -251,13 +343,26 @@ class Game:
         for _ in range(multi_bend_count):
             placed = False
             for _ in range(multi_bend_attempts):
-                path = self.generate_bent_path(empty_cells, rng, min_bends=2, max_bends=5)
+                path = self.generate_bent_path(
+                    empty_cells,
+                    empty_cells_list,
+                    rng,
+                    min_bends=2,
+                    max_bends=5,
+                )
                 if path is None:
                     continue
 
                 candidate = self.make_snake_arrow_candidate(path)
                 if self.is_snake_arrow_path_clear(candidate, grid):
-                    self.commit_snake_arrow(candidate, occupied, empty_cells, grid, arrows)
+                    self.commit_snake_arrow(
+                        candidate,
+                        occupied,
+                        empty_cells,
+                        empty_cells_list,
+                        grid,
+                        arrows,
+                    )
                     placed = True
                     break
 
@@ -291,25 +396,31 @@ class Game:
             direction = self.direction_between(cells[1], cells[0])
         return {"cells": cells, "direction": direction}
 
-    def commit_snake_arrow(self, arrow, occupied, empty_cells, grid, arrows):
+    def commit_snake_arrow(self, arrow, occupied, empty_cells, empty_cells_list, grid, arrows):
         """把通过路径检测的候选箭头正式写入占用数据。"""
         arrow_id = len(arrows) + 1
         for row, col in arrow["cells"]:
             occupied.add((row, col))
-            empty_cells.discard((row, col))
+            if (row, col) in empty_cells:
+                empty_cells.remove((row, col))
+                empty_cells_list.remove((row, col))
             grid[row][col] = arrow_id
         arrows.append(arrow)
 
-    def generate_bent_path(self, empty_cells, rng, min_bends, max_bends):
-        """随机生成一条长度至少为 3 且满足弯折次数要求的路径。"""
+    def generate_bent_path(self, empty_cells, empty_cells_list, rng, min_bends, max_bends):
+        """随机生成一条满足弯折次数要求的路径。
+
+        使用 O(1) 的 empty_cells_list 选取起点，避免反复把集合转成 tuple。
+        """
         size = self.BOARD_SIZE
         path_attempts = 300 if size >= 13 else 150
+
         for _ in range(path_attempts):
-            if not empty_cells:
+            if not empty_cells_list:
                 return None
 
             target_length = rng.randint(3, min(6, size))
-            start_row, start_col = rng.choice(tuple(empty_cells))
+            start_row, start_col = rng.choice(empty_cells_list)
             path = [(start_row, start_col)]
             previous_direction = None
             bends = 0
@@ -360,6 +471,91 @@ class Game:
 
         return None
 
+    def build_template_path(self, start, directions, step_counts):
+        """按方向和步数模板生成路径，任何越界/占用都返回 None。"""
+        size = self.BOARD_SIZE
+        path = [start]
+
+        for direction, steps in zip(directions, step_counts):
+            dr, dc = self.DIRECTIONS[direction]
+            for _ in range(steps):
+                row = path[-1][0] + dr
+                col = path[-1][1] + dc
+                if not (
+                    0 <= row < size
+                    and 0 <= col < size
+                    and (row, col) in self._current_empty_cells
+                    and (row, col) not in path
+                ):
+                    return None
+                path.append((row, col))
+
+        return path
+
+    def generate_one_bend_path(self, empty_cells_list, rng):
+        """一次弯折模板：直走一段 -> 转一次 -> 继续直走。"""
+        if not empty_cells_list:
+            return None
+
+        size = self.BOARD_SIZE
+        target_length = rng.randint(3, min(6, size))
+
+        for _ in range(120):
+            start = rng.choice(empty_cells_list)
+            first_direction = rng.choice([1, 2, 3, 4])
+            second_direction = rng.choice(
+                [d for d in (1, 2, 3, 4) if d not in (first_direction, self.opposite_direction(first_direction))]
+            )
+
+            first_steps = rng.randint(1, target_length - 2)
+            second_steps = target_length - 1 - first_steps
+            path = self.build_template_path(
+                start,
+                (first_direction, second_direction),
+                (first_steps, second_steps),
+            )
+            if path is not None:
+                return path
+
+        return None
+
+    def generate_multi_bend_path(self, empty_cells_list, rng, min_bends, max_bends):
+        """多次弯折模板：至少转两次，适合第三关 50% 的多次弯折箭头。"""
+        if not empty_cells_list:
+            return None
+
+        size = self.BOARD_SIZE
+        target_length = rng.randint(4, min(6, size))
+
+        for _ in range(160):
+            start = rng.choice(empty_cells_list)
+            first_direction = rng.choice([1, 2, 3, 4])
+            second_direction = rng.choice(
+                [d for d in (1, 2, 3, 4) if d not in (first_direction, self.opposite_direction(first_direction))]
+            )
+            third_direction = rng.choice(
+                [d for d in (1, 2, 3, 4) if d not in (second_direction, self.opposite_direction(second_direction))]
+            )
+
+            # 至少三段：a + b + c = target_length - 1
+            total_steps = target_length - 1
+            first_steps = rng.randint(1, total_steps - 2)
+            remaining = total_steps - first_steps
+            second_steps = rng.randint(1, remaining - 1)
+            third_steps = remaining - second_steps
+
+            path = self.build_template_path(
+                start,
+                (first_direction, second_direction, third_direction),
+                (first_steps, second_steps, third_steps),
+            )
+            if path is not None:
+                bends = 2 if second_direction != first_direction and third_direction != second_direction else 3
+                if min_bends <= bends <= max_bends:
+                    return path
+
+        return None
+
     @staticmethod
     def opposite_direction(direction):
         """返回相反方向。"""
@@ -393,7 +589,7 @@ class Game:
                 for col in range(self.BOARD_SIZE)
             }
 
-            long_arrow_count = max(1, round(self.TOTAL_ARROWS * self.LONG_ARROW_RATIO))
+            long_arrow_count = round(self.TOTAL_ARROWS * self.LONG_ARROW_RATIO)
             single_arrow_count = self.TOTAL_ARROWS - long_arrow_count
 
             # 先生成箭头类型列表：长箭头的身体为 2 或 3 格
@@ -619,6 +815,7 @@ class Game:
             self.start_flying_animation(cells, direction)
         else:
             print(f"格子 ({row}, {col})：{direction_names[direction]}方向箭头 -> 被阻挡")
+            self.play_sound(self.sound_error)
             # 在爱心扣除前，先为即将消失的爱心生成碎裂粒子
             if self.mistakes_left > 0:
                 self.spawn_heart_break(self.mistakes_left - 1)
@@ -822,6 +1019,8 @@ class Game:
 
         arrow["cells"] = []
         self.remaining_arrows = max(0, self.remaining_arrows - 1)
+        self.score += 10
+        self.play_sound(self.sound_success)
 
         if self.remaining_arrows == 0 and self.scene == "game":
             self.scene = "win"
@@ -829,6 +1028,7 @@ class Game:
     def trigger_snake_blocked(self, arrow_index):
         """蛇形箭头被阻挡时触发爱心扣减和红色晃动反馈，但不移动箭头。"""
         arrow = self.arrows[arrow_index]
+        self.play_sound(self.sound_error)
 
         if self.mistakes_left > 0:
             self.spawn_heart_break(self.mistakes_left - 1)
@@ -994,13 +1194,50 @@ class Game:
 
     def action_select_level(self, level_number):
         """选择指定关卡并开始游戏。"""
+        self.endless_mode = False
+        self.score = 0
+        self.elapsed_time = 0.0
         self.apply_level_config(level_number)
+        self.scene = "game"
+
+    def action_start_endless(self):
+        """进入无尽模式。"""
+        self.endless_mode = True
+        self.score = 0
+        self.elapsed_time = 0.0
+        self.mistakes_left = self.INITIAL_MISTAKES
+        self.start_endless_level()
+
+    def start_endless_level(self):
+        """生成无尽模式新地图，地图规则与第三关相同。"""
+        config = self.LEVELS[3]
+        self.current_level = 3
+        self.BOARD_SIZE = config["size"]
+        self.CELL_SIZE = config["cell_size"]
+        self.TOTAL_ARROWS = config["total_arrows"]
+        self.use_snake_movement = True
+
+        self.arrows = self.generate_snake_level()
+        self.level_data = [[0 for _ in range(self.BOARD_SIZE)] for _ in range(self.BOARD_SIZE)]
+        self.remaining_arrows = len(self.arrows)
+        self.snake_animation = None
+        self.shake_animation = None
+        self.snake_flying_animation = None
+        self.heart_particles = []
         self.scene = "game"
 
     def reset_game(self):
         """重置当前棋盘、爱心数量和动画状态，并进入游戏场景。"""
-        self.apply_level_config(self.current_level)
-        self.scene = "game"
+        if self.endless_mode:
+            self.score = 0
+            self.elapsed_time = 0.0
+            self.mistakes_left = self.INITIAL_MISTAKES
+            self.start_endless_level()
+        else:
+            self.score = 0
+            self.elapsed_time = 0.0
+            self.apply_level_config(self.current_level)
+            self.scene = "game"
 
     def build_result_buttons(self):
         """根据当前结算场景创建通关或失败界面的按钮。"""
@@ -1058,6 +1295,18 @@ class Game:
                     "action": lambda level=level_number: self.action_select_level(level),
                 }
             )
+
+        # 无尽模式按钮
+        y = 250 + len(self.LEVELS) * (button_height + gap)
+        rect = pygame.Rect(0, 0, button_width, button_height)
+        rect.center = (center_x, y + button_height // 2)
+        buttons.append(
+            {
+                "rect": rect,
+                "label": "无尽模式",
+                "action": self.action_start_endless,
+            }
+        )
 
         return buttons
 
@@ -1748,7 +1997,7 @@ class Game:
         """返回第 index 颗爱心在 HUD 中的中心坐标。"""
         label_surface = self.subtitle_font.render("剩余机会：", True, self.TEXT_COLOR)
         hearts_start_x = 20 + label_surface.get_width() + 8
-        hearts_y = 18 + 30 + 30
+        hearts_y = 12 + 4 * 20
         size = 24
         spacing = size + 8
         center_x = hearts_start_x + index * spacing + size // 2
@@ -1814,16 +2063,18 @@ class Game:
 
     def draw_hud(self):
         """在左上角显示当前关卡、剩余箭头数和爱心图标。"""
-        x, y = 20, 18
+        x, y = 20, 12
 
         lines = (
             f"当前关卡：{self.current_level}",
             f"剩余箭头：{self.remaining_arrows}",
+            f"得分：{self.score}",
+            f"时间：{int(self.elapsed_time)}s",
         )
         for line in lines:
             text_surface = self.subtitle_font.render(line, True, self.TEXT_COLOR)
             self.screen.blit(text_surface, (x, y))
-            y += 30
+            y += 20
 
         # 第三行显示“剩余机会”和对应数量的爱心
         label_surface = self.subtitle_font.render("剩余机会：", True, self.TEXT_COLOR)
@@ -1922,7 +2173,8 @@ class Game:
 
     def draw_lose_screen(self):
         """绘制失败界面。"""
-        self.draw_result_screen("失败", "剩余机会已用完", self.ICON_X_COLOR)
+        subtitle = f"剩余机会已用完，得分：{self.score}"
+        self.draw_result_screen("失败", subtitle, self.ICON_X_COLOR)
 
     def draw_level_select(self):
         """绘制选关界面。"""
@@ -2002,6 +2254,8 @@ class Game:
 
             self.remaining_arrows = max(0, self.remaining_arrows - 1)
             self.flying_animation = None
+            self.score += 10
+            self.play_sound(self.sound_success)
 
             if self.remaining_arrows == 0 and self.scene == "game":
                 self.scene = "win"
@@ -2061,6 +2315,9 @@ class Game:
 
     def update(self, dt):
         """更新动画状态。"""
+        if self.scene == "game":
+            self.elapsed_time += dt
+
         if self.use_snake_movement:
             self.update_snake_animation(dt)
             self.update_snake_flying_animation(dt)
@@ -2072,6 +2329,13 @@ class Game:
             if self.shake_animation is not None:
                 self.update_shake_animation(dt)
         self.update_heart_particles(dt)
+
+        # 无尽模式通关后继续生成新地图，不重置剩余失误次数。
+        if self.scene == "win" and self.endless_mode:
+            if self.mistakes_left > 0:
+                self.start_endless_level()
+            else:
+                self.scene = "lose"
 
     def run(self):
         """运行游戏主循环，直到收到退出请求。"""
