@@ -2,14 +2,15 @@
 
 本文件负责：
 1. 创建 800x600 的游戏窗口，并支持窗口/全屏模式切换。
-2. 显示带图标的主菜单（开始游戏、设置、离开游戏）。
+2. 显示主菜单、选关界面和三个可通关的 9x9/11x11/13x13 关卡。
 3. 提供设置界面，用开关切换窗口模式和全屏模式。
 4. 渲染 9x9 棋盘，并根据关卡二维数组显示不同颜色的方向箭头。
 5. 部分箭头由 1 个三角形和 2-3 格长条身体组成，并规避格子重叠与无法通关的死局。
 6. 检测点击的箭头是否能飞出棋盘，并在控制台输出结果。
 7. 播放飞出/阻挡动画，显示关卡、剩余箭头，并在扣除机会时播放爱心碎裂特效。
 8. 清除全部箭头后进入通关界面，机会耗尽后进入失败界面。
-9. 以 60FPS 运行完整主循环。
+9. 支持关卡重开、返回选关界面和返回大厅。
+10. 以 60FPS 运行完整主循环。
 """
 
 import math
@@ -33,6 +34,13 @@ class Game:
     BOARD_SIZE = 9
     CELL_SIZE = 40
     CELL_GAP = 2
+
+    # 三个关卡配置：棋盘尺寸、格子像素大小和箭头总数
+    LEVELS = {
+        1: {"size": 9, "cell_size": 40, "total_arrows": 20},
+        2: {"size": 11, "cell_size": 36, "total_arrows": 30},
+        3: {"size": 13, "cell_size": 32, "total_arrows": 42},
+    }
 
     # 箭头总数，以及其中使用 2-3 个正方形组成的长箭头占比
     TOTAL_ARROWS = 20
@@ -93,11 +101,9 @@ class Game:
         self.is_fullscreen = False
         # 当前界面：menu 为主菜单，settings 为设置界面
         self.scene = "menu"
-        # 当前要渲染的关卡数据，生成时已规避格子重叠，并保证关卡可通关
-        self.level_data = self.generate_level()
+        # 默认加载第 1 关，并初始化该关卡的棋盘尺寸、箭头数和关卡数据
         self.current_level = 1
-        self.mistakes_left = self.INITIAL_MISTAKES
-        self.remaining_arrows = self.count_arrow_groups(self.level_data)
+        self.apply_level_config(self.current_level)
 
         # 当前正在播放的箭头动画；同一时间只播放一个
         self.flying_animation = None
@@ -119,6 +125,21 @@ class Game:
         """创建指定大小的中文字体对象。"""
         font_names = ["microsoftyahei", "msyh", "simhei", "simsun"]
         return pygame.font.SysFont(font_names, size)
+
+    def apply_level_config(self, level_number):
+        """按关卡编号设置棋盘尺寸、格子大小和箭头数量，并生成关卡。"""
+        config = self.LEVELS[level_number]
+        self.current_level = level_number
+        self.BOARD_SIZE = config["size"]
+        self.CELL_SIZE = config["cell_size"]
+        self.TOTAL_ARROWS = config["total_arrows"]
+
+        self.level_data = self.generate_level()
+        self.mistakes_left = self.INITIAL_MISTAKES
+        self.remaining_arrows = self.count_arrow_groups(self.level_data)
+        self.flying_animation = None
+        self.shake_animation = None
+        self.heart_particles = []
 
     def generate_level(self, base_seed=20260918):
         """生成一个保证可以按某种顺序全部消除的 9x9 关卡。
@@ -254,6 +275,8 @@ class Game:
                 self.handle_menu_events(event)
             elif self.scene == "settings":
                 self.handle_settings_events(event)
+            elif self.scene == "level_select":
+                self.handle_level_select_events(event)
             elif self.scene == "game":
                 self.handle_game_events(event)
             elif self.scene in ("win", "lose"):
@@ -291,11 +314,21 @@ class Game:
     def handle_game_events(self, event):
         """处理棋盘场景的事件。
 
-        鼠标左键用于检测箭头能否飞出，ESC 用于返回主菜单。
+        鼠标左键用于点击棋盘箭头或右上角按钮，ESC 用于退回选关界面。
         """
         if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
             self.scene = "menu"
-        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            return
+
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            # 优先处理右上角的重新开始和返回选关按钮
+            if self.get_game_restart_button_rect().collidepoint(event.pos):
+                self.reset_game()
+                return
+            if self.get_game_level_select_button_rect().collidepoint(event.pos):
+                self.scene = "level_select"
+                return
+
             self.handle_board_click(event.pos)
 
     def handle_result_events(self, event):
@@ -304,6 +337,18 @@ class Game:
             return
 
         for button in self.build_result_buttons():
+            if not button.get("enabled", True):
+                continue
+            if button["rect"].collidepoint(event.pos):
+                button["action"]()
+                break
+
+    def handle_level_select_events(self, event):
+        """处理选关界面中的关卡按钮点击。"""
+        if event.type != pygame.MOUSEBUTTONDOWN or event.button != 1:
+            return
+
+        for button in self.build_level_select_buttons():
             if button["rect"].collidepoint(event.pos):
                 button["action"]()
                 break
@@ -431,19 +476,19 @@ class Game:
         button_height = 68
         gap = 24
 
+        items = (
+            {"label": "开始游戏", "icon": "triangle", "action": self.action_start_game},
+            {"label": "设置", "icon": "gear", "action": self.action_open_settings},
+            {"label": "离开游戏", "icon": "x", "action": self.action_quit_game},
+        )
+
         # 按钮列整体居中，并在垂直方向上稍微偏下，为标题留出空间
-        total_height = button_height * 3 + gap * 2
+        total_height = len(items) * button_height + (len(items) - 1) * gap
         start_y = self.screen.get_height() // 2 - total_height // 2 + 50
         center_x = self.screen.get_width() // 2
 
         buttons = []
-        for index, item in enumerate(
-            (
-                {"label": "开始游戏", "icon": "triangle", "action": self.action_start_game},
-                {"label": "设置", "icon": "gear", "action": self.action_open_settings},
-                {"label": "离开游戏", "icon": "x", "action": self.action_quit_game},
-            )
-        ):
+        for index, item in enumerate(items):
             y = start_y + index * (button_height + gap)
             rect = pygame.Rect(0, 0, button_width, button_height)
             rect.center = (center_x, y + button_height // 2)
@@ -454,9 +499,9 @@ class Game:
     def action_start_game(self):
         """“开始游戏”按钮的回调。
 
-        点击后重置当前关卡并进入棋盘场景。
+        点击后进入选关界面。
         """
-        self.reset_game()
+        self.scene = "level_select"
 
     def action_open_settings(self):
         """“设置”按钮的回调，进入设置界面。"""
@@ -474,15 +519,24 @@ class Game:
         """失败界面中“重新开始”按钮的回调。"""
         self.reset_game()
 
+    def action_next_level(self):
+        """通关界面中“下一关”按钮的回调。"""
+        if self.current_level < max(self.LEVELS):
+            self.apply_level_config(self.current_level + 1)
+            self.scene = "game"
+
+    def action_back_to_level_select(self):
+        """退回选关界面。"""
+        self.scene = "level_select"
+
+    def action_select_level(self, level_number):
+        """选择指定关卡并开始游戏。"""
+        self.apply_level_config(level_number)
+        self.scene = "game"
+
     def reset_game(self):
         """重置当前棋盘、爱心数量和动画状态，并进入游戏场景。"""
-        self.level_data = self.generate_level()
-        self.current_level = 1
-        self.mistakes_left = self.INITIAL_MISTAKES
-        self.remaining_arrows = self.count_arrow_groups(self.level_data)
-        self.flying_animation = None
-        self.shake_animation = None
-        self.heart_particles = []
+        self.apply_level_config(self.current_level)
         self.scene = "game"
 
     def build_result_buttons(self):
@@ -493,13 +547,21 @@ class Game:
         gap = 20
 
         if self.scene == "win":
+            has_next_level = self.current_level < max(self.LEVELS)
             items = (
+                {
+                    "label": "下一关",
+                    "action": self.action_next_level,
+                    "enabled": has_next_level,
+                },
+                {"label": "返回选关", "action": self.action_back_to_level_select},
                 {"label": "返回大厅", "action": self.action_return_lobby},
             )
         else:
             items = (
                 {"label": "重新开始", "action": self.action_restart_game},
                 {"label": "返回大厅", "action": self.action_return_lobby},
+                {"label": "返回选关", "action": self.action_back_to_level_select},
             )
 
         buttons = []
@@ -511,6 +573,28 @@ class Game:
             rect = pygame.Rect(0, 0, button_width, button_height)
             rect.center = (center_x, y + button_height // 2)
             buttons.append({"rect": rect, **item})
+
+        return buttons
+
+    def build_level_select_buttons(self):
+        """创建选关界面的三个关卡按钮。"""
+        center_x = self.screen.get_width() // 2
+        button_width = 320
+        button_height = 64
+        gap = 22
+
+        buttons = []
+        for index, (level_number, config) in enumerate(self.LEVELS.items()):
+            y = 250 + index * (button_height + gap)
+            rect = pygame.Rect(0, 0, button_width, button_height)
+            rect.center = (center_x, y + button_height // 2)
+            buttons.append(
+                {
+                    "rect": rect,
+                    "label": f"第 {level_number} 关（{config['size']}x{config['size']}）",
+                    "action": lambda level=level_number: self.action_select_level(level),
+                }
+            )
 
         return buttons
 
@@ -533,6 +617,23 @@ class Game:
         center_y = self.screen.get_height() // 2 + 120
         rect = pygame.Rect(0, 0, width, height)
         rect.center = (center_x, center_y)
+        return rect
+
+    def get_game_level_select_button_rect(self):
+        """返回游戏界面右上角“返回选关”按钮的区域。"""
+        width, height = 130, 40
+        margin = 20
+        rect = pygame.Rect(0, 0, width, height)
+        rect.topright = (self.screen.get_width() - margin, 18)
+        return rect
+
+    def get_game_restart_button_rect(self):
+        """返回游戏界面右上角“重新开始”按钮的区域。"""
+        width, height = 130, 40
+        gap = 10
+        back_rect = self.get_game_level_select_button_rect()
+        rect = pygame.Rect(0, 0, width, height)
+        rect.topright = (back_rect.left - gap, 18)
         return rect
 
     # ------------------------------------------------------------------
@@ -575,6 +676,19 @@ class Game:
         # 绘制齿轮主体圆环和中心孔
         pygame.draw.circle(surface, color, center, int(inner_radius), 4)
         pygame.draw.circle(surface, color, center, int(radius * 0.28), 0)
+
+    @staticmethod
+    def draw_level_icon(surface, center, size, color):
+        """绘制选关按钮前的四宫格图标。"""
+        half = size // 2
+        gap = max(2, size // 10)
+        cell_size = (size - gap) // 2
+
+        for row in range(2):
+            for col in range(2):
+                x = center[0] - half + col * (cell_size + gap)
+                y = center[1] - half + row * (cell_size + gap)
+                pygame.draw.rect(surface, color, (x, y, cell_size, cell_size), border_radius=2)
 
     @staticmethod
     def draw_x_icon(surface, center, size, color):
@@ -621,6 +735,8 @@ class Game:
             self.draw_triangle_icon(self.screen, icon_center, icon_size, self.ICON_TRIANGLE_COLOR)
         elif button["icon"] == "gear":
             self.draw_gear_icon(self.screen, icon_center, icon_size // 2, self.ICON_GEAR_COLOR)
+        elif button["icon"] == "level":
+            self.draw_level_icon(self.screen, icon_center, icon_size, self.ICON_GEAR_COLOR)
         elif button["icon"] == "x":
             self.draw_x_icon(self.screen, icon_center, icon_size, self.ICON_X_COLOR)
 
@@ -1146,12 +1262,31 @@ class Game:
         """绘制通关或失败界面中的普通文字按钮。"""
         rect = button["rect"]
         mouse_pos = pygame.mouse.get_pos()
-        hovered = rect.collidepoint(mouse_pos)
+        enabled = button.get("enabled", True)
+        hovered = enabled and rect.collidepoint(mouse_pos)
 
-        background = self.BUTTON_HOVER_COLOR if hovered else self.BUTTON_COLOR
+        if not enabled:
+            background = (52, 54, 60)
+            border_color = (72, 74, 82)
+            text_color = (110, 112, 120)
+        else:
+            background = self.BUTTON_HOVER_COLOR if hovered else self.BUTTON_COLOR
+            border_color = self.BUTTON_BORDER_COLOR
+            text_color = self.BUTTON_TEXT_COLOR
+
         pygame.draw.rect(self.screen, background, rect, border_radius=14)
-        pygame.draw.rect(self.screen, self.BUTTON_BORDER_COLOR, rect, width=2, border_radius=14)
-        self.draw_text(self.screen, self.button_font, button["label"], self.BUTTON_TEXT_COLOR, rect.center)
+        pygame.draw.rect(self.screen, border_color, rect, width=2, border_radius=14)
+        self.draw_text(self.screen, self.button_font, button["label"], text_color, rect.center)
+
+    def draw_game_top_button(self, rect, label):
+        """绘制游戏界面右上角的小型功能按钮。"""
+        mouse_pos = pygame.mouse.get_pos()
+        hovered = rect.collidepoint(mouse_pos)
+        background = self.BUTTON_HOVER_COLOR if hovered else self.BUTTON_COLOR
+
+        pygame.draw.rect(self.screen, background, rect, border_radius=10)
+        pygame.draw.rect(self.screen, self.BUTTON_BORDER_COLOR, rect, width=2, border_radius=10)
+        self.draw_text(self.screen, self.subtitle_font, label, self.BUTTON_TEXT_COLOR, rect.center)
 
     def draw_result_screen(self, title, subtitle, title_color):
         """绘制通关或失败界面共用的布局。"""
@@ -1174,16 +1309,43 @@ class Game:
         """绘制失败界面。"""
         self.draw_result_screen("失败", "剩余机会已用完", self.ICON_X_COLOR)
 
+    def draw_level_select(self):
+        """绘制选关界面。"""
+        self.screen.fill(self.BG_COLOR)
+
+        title_center = (self.screen.get_width() // 2, 120)
+        self.draw_text(self.screen, self.title_font, "选择关卡", self.TITLE_COLOR, title_center)
+
+        subtitle_center = (self.screen.get_width() // 2, 185)
+        self.draw_text(self.screen, self.subtitle_font, "选择一个棋盘大小开始游戏", self.MUTED_COLOR, subtitle_center)
+
+        for button in self.build_level_select_buttons():
+            self.draw_result_button(button)
+
     def draw_game(self):
         """绘制棋盘场景，显示 HUD、棋盘和当前动画。"""
         self.screen.fill(self.BG_COLOR)
         self.draw_hud()
 
-        title_center = (self.screen.get_width() // 2, 80)
-        self.draw_text(self.screen, self.title_font, "第 1 关", self.TITLE_COLOR, title_center)
+        board_left, board_top = self.get_board_top_left()
+        center_x = self.screen.get_width() // 2
 
-        hint_center = (self.screen.get_width() // 2, 128)
-        self.draw_text(self.screen, self.subtitle_font, "按 ESC 返回主菜单", self.MUTED_COLOR, hint_center)
+        # 根据棋盘顶部位置放置标题和提示，避免大棋盘遮挡文字
+        title_center = (center_x, max(60, board_top - 100))
+        self.draw_text(
+            self.screen,
+            self.title_font,
+            f"第 {self.current_level} 关",
+            self.TITLE_COLOR,
+            title_center,
+        )
+
+        hint_center = (center_x, max(105, board_top - 30))
+        self.draw_text(self.screen, self.subtitle_font, "按 ESC 返回主界面", self.MUTED_COLOR, hint_center)
+
+        # 右上角功能按钮
+        self.draw_game_top_button(self.get_game_restart_button_rect(), "重新开始")
+        self.draw_game_top_button(self.get_game_level_select_button_rect(), "返回选关")
 
         # 渲染棋盘和箭头
         skip_cells = self.get_active_animation_cells()
@@ -1196,6 +1358,8 @@ class Game:
             self.draw_menu()
         elif self.scene == "settings":
             self.draw_settings()
+        elif self.scene == "level_select":
+            self.draw_level_select()
         elif self.scene == "game":
             self.draw_game()
         elif self.scene == "win":
