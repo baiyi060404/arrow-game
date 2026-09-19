@@ -7,7 +7,7 @@
 4. 渲染 9x9 棋盘，并根据关卡二维数组显示不同颜色的方向箭头。
 5. 部分箭头由 1 个三角形和 2-3 格长条身体组成，并规避格子重叠与无法通关的死局。
 6. 检测点击的箭头是否能飞出棋盘，并在控制台输出结果。
-7. 播放飞出/阻挡动画，并显示关卡、剩余箭头和失误次数。
+7. 播放飞出/阻挡动画，显示关卡、剩余箭头，并在扣除机会时播放爱心碎裂特效。
 8. 清除全部箭头后进入通关界面，机会耗尽后进入失败界面。
 9. 以 60FPS 运行完整主循环。
 """
@@ -102,6 +102,8 @@ class Game:
         # 当前正在播放的箭头动画；同一时间只播放一个
         self.flying_animation = None
         self.shake_animation = None
+        # 爱心扣除时产生的碎裂粒子
+        self.heart_particles = []
 
         self.screen = pygame.display.set_mode(self.WINDOW_SIZE)
         pygame.display.set_caption(self.TITLE)
@@ -335,6 +337,9 @@ class Game:
             self.start_flying_animation(cells, direction)
         else:
             print(f"格子 ({row}, {col})：{direction_names[direction]}方向箭头 -> 被阻挡")
+            # 在爱心扣除前，先为即将消失的爱心生成碎裂粒子
+            if self.mistakes_left > 0:
+                self.spawn_heart_break(self.mistakes_left - 1)
             # 每次被阻挡扣 1 次失误，最低保持为 0
             self.mistakes_left = max(0, self.mistakes_left - 1)
             self.start_shake_animation(cells, direction)
@@ -477,6 +482,7 @@ class Game:
         self.remaining_arrows = self.count_arrow_groups(self.level_data)
         self.flying_animation = None
         self.shake_animation = None
+        self.heart_particles = []
         self.scene = "game"
 
     def build_result_buttons(self):
@@ -637,29 +643,63 @@ class Game:
         pygame.draw.circle(self.screen, self.SWITCH_KNOB_COLOR, knob_center, knob_radius)
 
     def draw_arrow(self, surface, center, direction, offset=(0, 0), color_override=None):
-        """根据方向值在指定中心绘制三角形箭头。
+        """在单个格子中绘制由三角形箭头和长方形箭身组成的箭头。
 
         方向约定：1=上，2=下，3=左，4=右。
+        长方形箭身的中轴线与三角形底边上的高保持重合。
         """
         x = center[0] + offset[0]
         y = center[1] + offset[1]
         half = self.CELL_SIZE // 3
+        body_half = half / 2
         color = self.ARROW_COLORS.get(direction, self.TEXT_COLOR)
         if color_override is not None:
             color = color_override
 
         if direction == 1:
-            # 向上：顶点在上方
-            points = ((x, y - half), (x - half, y + half), (x + half, y + half))
+            # 向上：箭头顶点在上方，箭身位于箭头下方
+            points = (
+                (x - body_half, y + half),
+                (x + body_half, y + half),
+                (x + body_half, y),
+                (x + half, y),
+                (x, y - half),
+                (x - half, y),
+                (x - body_half, y),
+            )
         elif direction == 2:
-            # 向下：顶点在下方
-            points = ((x, y + half), (x - half, y - half), (x + half, y - half))
+            # 向下：箭头顶点在下方，箭身位于箭头上方
+            points = (
+                (x - body_half, y - half),
+                (x + body_half, y - half),
+                (x + body_half, y),
+                (x + half, y),
+                (x, y + half),
+                (x - half, y),
+                (x - body_half, y),
+            )
         elif direction == 3:
-            # 向左：顶点在左侧
-            points = ((x - half, y), (x + half, y - half), (x + half, y + half))
+            # 向左：箭头顶点在左侧，箭身位于箭头右侧
+            points = (
+                (x + half, y - body_half),
+                (x, y - body_half),
+                (x, y - half),
+                (x - half, y),
+                (x, y + half),
+                (x, y + body_half),
+                (x + half, y + body_half),
+            )
         elif direction == 4:
-            # 向右：顶点在右侧
-            points = ((x + half, y), (x - half, y - half), (x - half, y + half))
+            # 向右：箭头顶点在右侧，箭身位于箭头左侧
+            points = (
+                (x - half, y - body_half),
+                (x, y - body_half),
+                (x, y - half),
+                (x + half, y),
+                (x, y + half),
+                (x, y + body_half),
+                (x - half, y + body_half),
+            )
         else:
             return
 
@@ -973,14 +1013,23 @@ class Game:
         )
         pygame.draw.polygon(self.screen, color, points, circle_width)
 
-    def draw_hearts(self, x, y):
-        """在 HUD 中绘制剩余机会的爱心图标。"""
+    def get_heart_position(self, index):
+        """返回第 index 颗爱心在 HUD 中的中心坐标。"""
+        label_surface = self.subtitle_font.render("剩余机会：", True, self.TEXT_COLOR)
+        hearts_start_x = 20 + label_surface.get_width() + 8
+        hearts_y = 18 + 30 + 30
         size = 24
         spacing = size + 8
-        center_y = y + size // 2
+        center_x = hearts_start_x + index * spacing + size // 2
+        center_y = hearts_y + size // 2
+        return center_x, center_y
+
+    def draw_hearts(self):
+        """在 HUD 中绘制剩余机会的爱心图标。"""
+        size = 24
 
         for index in range(self.INITIAL_MISTAKES):
-            center_x = x + index * spacing + size // 2
+            center_x, center_y = self.get_heart_position(index)
             if index < self.mistakes_left:
                 self.draw_heart_icon(
                     center_x,
@@ -998,6 +1047,40 @@ class Game:
                     filled=False,
                 )
 
+    def spawn_heart_break(self, heart_index):
+        """在指定爱心位置生成一组碎裂粒子。"""
+        center_x, center_y = self.get_heart_position(heart_index)
+
+        for _ in range(18):
+            angle = random.uniform(0, math.pi * 2)
+            speed = random.uniform(50, 150)
+            self.heart_particles.append(
+                {
+                    "x": center_x,
+                    "y": center_y,
+                    "vx": math.cos(angle) * speed,
+                    "vy": math.sin(angle) * speed - 35,
+                    "life": random.uniform(0.35, 0.60),
+                    "max_life": 0.60,
+                    "size": random.randint(2, 5),
+                    "color": random.choice(
+                        (self.HEART_COLOR, (255, 145, 155), (190, 55, 75))
+                    ),
+                }
+            )
+
+    def draw_heart_particles(self):
+        """绘制爱心碎裂粒子。"""
+        for particle in self.heart_particles:
+            life_ratio = max(0.0, particle["life"] / particle["max_life"])
+            radius = max(1, int(particle["size"] * life_ratio))
+            pygame.draw.circle(
+                self.screen,
+                particle["color"],
+                (int(particle["x"]), int(particle["y"])),
+                radius,
+            )
+
     def draw_hud(self):
         """在左上角显示当前关卡、剩余箭头数和爱心图标。"""
         x, y = 20, 18
@@ -1014,7 +1097,8 @@ class Game:
         # 第三行显示“剩余机会”和对应数量的爱心
         label_surface = self.subtitle_font.render("剩余机会：", True, self.TEXT_COLOR)
         self.screen.blit(label_surface, (x, y))
-        self.draw_hearts(x + label_surface.get_width() + 8, y)
+        self.draw_hearts()
+        self.draw_heart_particles()
 
     # ------------------------------------------------------------------
     # 场景绘制
@@ -1149,12 +1233,26 @@ class Game:
             if self.mistakes_left <= 0 and self.scene == "game":
                 self.scene = "lose"
 
+    def update_heart_particles(self, dt):
+        """更新爱心碎裂粒子的位置和生命周期。"""
+        for particle in self.heart_particles[:]:
+            particle["life"] -= dt
+            if particle["life"] <= 0:
+                self.heart_particles.remove(particle)
+                continue
+
+            # 粒子受轻微重力影响，并持续向外飞散
+            particle["vy"] += 180 * dt
+            particle["x"] += particle["vx"] * dt
+            particle["y"] += particle["vy"] * dt
+
     def update(self, dt):
         """更新动画状态。"""
         if self.flying_animation is not None:
             self.update_flying_animation(dt)
         if self.shake_animation is not None:
             self.update_shake_animation(dt)
+        self.update_heart_particles(dt)
 
     def run(self):
         """运行游戏主循环，直到收到退出请求。"""
