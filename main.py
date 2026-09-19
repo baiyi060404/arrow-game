@@ -13,6 +13,7 @@
 10. 以 60FPS 运行完整主循环。
 """
 
+import copy
 import math
 import random
 import sys
@@ -38,7 +39,7 @@ class Game:
     # 三个关卡配置：棋盘尺寸、格子像素大小和箭头总数
     LEVELS = {
         1: {"size": 9, "cell_size": 40, "total_arrows": 20},
-        2: {"size": 11, "cell_size": 36, "total_arrows": 30},
+        2: {"size": 11, "cell_size": 36, "total_arrows": 24},
         3: {"size": 13, "cell_size": 32, "total_arrows": 34},
     }
 
@@ -50,6 +51,7 @@ class Game:
     # 动画参数
     FLY_DURATION = 0.30
     SNAKE_STEP_INTERVAL = 0.08
+    SNAKE_MULTI_STEP_INTERVAL = 0.045
     SHAKE_DURATION = 0.70
     SHAKE_AMPLITUDE = 8
     BLOCKED_COLOR = (255, 80, 80)
@@ -104,6 +106,8 @@ class Game:
         self.scene = "menu"
         # 默认加载第 1 关，并初始化该关卡的棋盘尺寸、箭头数和关卡数据
         self.current_level = 1
+        # 缓存每个关卡的原始生成结果，重新开始时直接复制，避免重复生成。
+        self.level_cache = {}
         self.apply_level_config(self.current_level)
 
         # 当前正在播放的箭头动画；同一时间只播放一个
@@ -138,25 +142,43 @@ class Game:
 
         self.use_snake_movement = level_number > 1
 
-        if self.use_snake_movement:
-            # 第二、三关使用可弯折的多段箭头
-            self.arrows = self.generate_snake_level()
-            self.level_data = [[0 for _ in range(self.BOARD_SIZE)] for _ in range(self.BOARD_SIZE)]
-            self.remaining_arrows = len(self.arrows)
-            self.snake_animation = None
-            self.snake_flying_animation = None
+        if level_number in self.level_cache:
+            cached_level = self.level_cache[level_number]
+            if self.use_snake_movement:
+                self.arrows = copy.deepcopy(cached_level["arrows"])
+                self.snake_grid = copy.deepcopy(cached_level["snake_grid"])
+                self.level_data = [[0 for _ in range(self.BOARD_SIZE)] for _ in range(self.BOARD_SIZE)]
+            else:
+                self.level_data = copy.deepcopy(cached_level["level_data"])
+                self.arrows = None
+                self.snake_grid = None
         else:
-            # 第一关保持原来的直线箭头生成方式
-            self.level_data = self.generate_level()
-            self.arrows = None
-            self.snake_grid = None
-            self.snake_animation = None
-            self.snake_flying_animation = None
-            self.remaining_arrows = self.count_arrow_groups(self.level_data)
+            if self.use_snake_movement:
+                # 第二、三关使用可弯折的多段箭头
+                self.arrows = self.generate_snake_level()
+                self.level_data = [[0 for _ in range(self.BOARD_SIZE)] for _ in range(self.BOARD_SIZE)]
+                self.level_cache[level_number] = {
+                    "arrows": copy.deepcopy(self.arrows),
+                    "snake_grid": copy.deepcopy(self.snake_grid),
+                }
+            else:
+                # 第一关保持原来的直线箭头生成方式
+                self.level_data = self.generate_level()
+                self.arrows = None
+                self.snake_grid = None
+                self.level_cache[level_number] = {
+                    "level_data": copy.deepcopy(self.level_data),
+                }
+
+        self.remaining_arrows = (
+            len(self.arrows) if self.use_snake_movement else self.count_arrow_groups(self.level_data)
+        )
 
         self.mistakes_left = self.INITIAL_MISTAKES
         self.flying_animation = None
         self.shake_animation = None
+        self.snake_animation = None
+        self.snake_flying_animation = None
         self.heart_particles = []
 
     def generate_snake_level(self):
@@ -174,6 +196,11 @@ class Game:
         size = self.BOARD_SIZE
         grid = [[0 for _ in range(size)] for _ in range(size)]
         occupied = set()
+        empty_cells = {
+            (row, col)
+            for row in range(size)
+            for col in range(size)
+        }
         arrows = []
 
         multi_count = round(self.TOTAL_ARROWS * 0.80)
@@ -188,21 +215,15 @@ class Game:
         for _ in range(single_count):
             placed = False
             for _ in range(single_attempts):
-                empty_cells = [
-                    (row, col)
-                    for row in range(size)
-                    for col in range(size)
-                    if (row, col) not in occupied
-                ]
                 if not empty_cells:
                     return None, None
 
-                row, col = rng.choice(empty_cells)
+                row, col = rng.choice(tuple(empty_cells))
                 direction = rng.choice([1, 2, 3, 4])
                 candidate = {"cells": [(row, col)], "direction": direction}
 
                 if self.is_snake_arrow_path_clear(candidate, grid):
-                    self.commit_snake_arrow(candidate, occupied, grid, arrows)
+                    self.commit_snake_arrow(candidate, occupied, empty_cells, grid, arrows)
                     placed = True
                     break
 
@@ -213,13 +234,13 @@ class Game:
         for _ in range(one_bend_count):
             placed = False
             for _ in range(one_bend_attempts):
-                path = self.generate_bent_path(occupied, rng, min_bends=1, max_bends=1)
+                path = self.generate_bent_path(empty_cells, rng, min_bends=1, max_bends=1)
                 if path is None:
                     continue
 
                 candidate = self.make_snake_arrow_candidate(path)
                 if self.is_snake_arrow_path_clear(candidate, grid):
-                    self.commit_snake_arrow(candidate, occupied, grid, arrows)
+                    self.commit_snake_arrow(candidate, occupied, empty_cells, grid, arrows)
                     placed = True
                     break
 
@@ -230,13 +251,13 @@ class Game:
         for _ in range(multi_bend_count):
             placed = False
             for _ in range(multi_bend_attempts):
-                path = self.generate_bent_path(occupied, rng, min_bends=2, max_bends=5)
+                path = self.generate_bent_path(empty_cells, rng, min_bends=2, max_bends=5)
                 if path is None:
                     continue
 
                 candidate = self.make_snake_arrow_candidate(path)
                 if self.is_snake_arrow_path_clear(candidate, grid):
-                    self.commit_snake_arrow(candidate, occupied, grid, arrows)
+                    self.commit_snake_arrow(candidate, occupied, empty_cells, grid, arrows)
                     placed = True
                     break
 
@@ -270,30 +291,25 @@ class Game:
             direction = self.direction_between(cells[1], cells[0])
         return {"cells": cells, "direction": direction}
 
-    def commit_snake_arrow(self, arrow, occupied, grid, arrows):
+    def commit_snake_arrow(self, arrow, occupied, empty_cells, grid, arrows):
         """把通过路径检测的候选箭头正式写入占用数据。"""
         arrow_id = len(arrows) + 1
         for row, col in arrow["cells"]:
             occupied.add((row, col))
+            empty_cells.discard((row, col))
             grid[row][col] = arrow_id
         arrows.append(arrow)
 
-    def generate_bent_path(self, occupied, rng, min_bends, max_bends):
+    def generate_bent_path(self, empty_cells, rng, min_bends, max_bends):
         """随机生成一条长度至少为 3 且满足弯折次数要求的路径。"""
         size = self.BOARD_SIZE
         path_attempts = 300 if size >= 13 else 150
         for _ in range(path_attempts):
-            empty_cells = [
-                (row, col)
-                for row in range(size)
-                for col in range(size)
-                if (row, col) not in occupied
-            ]
             if not empty_cells:
                 return None
 
             target_length = rng.randint(3, min(6, size))
-            start_row, start_col = rng.choice(empty_cells)
+            start_row, start_col = rng.choice(tuple(empty_cells))
             path = [(start_row, start_col)]
             previous_direction = None
             bends = 0
@@ -311,7 +327,7 @@ class Game:
                     if not (
                         0 <= next_row < size
                         and 0 <= next_col < size
-                        and (next_row, next_col) not in occupied
+                        and (next_row, next_col) in empty_cells
                         and (next_row, next_col) not in path
                     ):
                         continue
@@ -638,13 +654,13 @@ class Game:
                 if not self.can_snake_arrow_fly_out(index):
                     self.trigger_snake_blocked(index)
                 elif len(arrow["cells"]) == 1:
-                    # 单格箭头没有身体跟随，使用连续像素偏移飞出动画，避免瞬间消失。
+                    # 单格箭头用一格的像素飞出动画，避免在边界瞬间消失。
                     self.start_snake_fly_animation(index)
                 else:
                     self.snake_animation = {
                         "arrow_index": index,
                         "elapsed": 0.0,
-                        "step_interval": self.SNAKE_STEP_INTERVAL,
+                        "step_interval": self.SNAKE_MULTI_STEP_INTERVAL,
                     }
                     print(f"箭头 {index + 1} 开始移动")
                 return
