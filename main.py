@@ -5,10 +5,11 @@
 2. 显示带图标的主菜单（开始游戏、设置、离开游戏）。
 3. 提供设置界面，用开关切换窗口模式和全屏模式。
 4. 渲染 9x9 棋盘，并根据关卡二维数组显示不同颜色的方向箭头。
-5. 部分箭头由 1 个三角形和 2-3 格长条身体组成，并规避格子重叠。
+5. 部分箭头由 1 个三角形和 2-3 格长条身体组成，并规避格子重叠与无法通关的死局。
 6. 检测点击的箭头是否能飞出棋盘，并在控制台输出结果。
 7. 播放飞出/阻挡动画，并显示关卡、剩余箭头和失误次数。
-8. 以 60FPS 运行完整主循环。
+8. 清除全部箭头后进入通关界面，机会耗尽后进入失败界面。
+9. 以 60FPS 运行完整主循环。
 """
 
 import math
@@ -67,6 +68,8 @@ class Game:
     SWITCH_ON_COLOR = (90, 200, 120)
     SWITCH_OFF_COLOR = (90, 95, 115)
     SWITCH_KNOB_COLOR = (245, 245, 245)
+    HEART_COLOR = (255, 90, 110)
+    HEART_EMPTY_COLOR = (90, 95, 115)
 
     # 棋盘与箭头配色
     BOARD_CELL_COLOR = (39, 44, 60)
@@ -90,7 +93,7 @@ class Game:
         self.is_fullscreen = False
         # 当前界面：menu 为主菜单，settings 为设置界面
         self.scene = "menu"
-        # 当前要渲染的关卡数据，生成时已规避长箭头之间的格子重叠
+        # 当前要渲染的关卡数据，生成时已规避格子重叠，并保证关卡可通关
         self.level_data = self.generate_level()
         self.current_level = 1
         self.mistakes_left = self.INITIAL_MISTAKES
@@ -115,82 +118,111 @@ class Game:
         font_names = ["microsoftyahei", "msyh", "simhei", "simsun"]
         return pygame.font.SysFont(font_names, size)
 
-    def generate_level(self):
-        """生成一个 9x9 的关卡二维数组。
+    def generate_level(self, base_seed=20260918):
+        """生成一个保证可以按某种顺序全部消除的 9x9 关卡。
 
         生成规则：
         - 0 表示空格，1/2/3/4 分别表示上、下、左、右箭头。
         - 约 10% 的箭头为长箭头，由 2-3 格长条身体和 1 个三角形箭头组成。
-        - 长箭头优先放置，剩余箭头只在空格上放置，因此不会发生格子重叠。
+        - 每个箭头在生成时，都必须保证它的前方路径中没有已放置的箭头。
+        - 因此按“后放置的先消除”顺序，可以稳定完成整关。
         """
-        # 使用固定随机种子，保证每次运行时测试关卡保持一致
-        rng = random.Random(20260918)
+        for attempt in range(200):
+            # 每次重试使用不同种子，避免固定失败模式反复出现
+            rng = random.Random(base_seed + attempt)
+            board = [[0 for _ in range(self.BOARD_SIZE)] for _ in range(self.BOARD_SIZE)]
+            empty_cells = {
+                (row, col)
+                for row in range(self.BOARD_SIZE)
+                for col in range(self.BOARD_SIZE)
+            }
 
-        board = [[0 for _ in range(self.BOARD_SIZE)] for _ in range(self.BOARD_SIZE)]
-        empty_cells = {
-            (row, col)
-            for row in range(self.BOARD_SIZE)
-            for col in range(self.BOARD_SIZE)
-        }
+            long_arrow_count = max(1, round(self.TOTAL_ARROWS * self.LONG_ARROW_RATIO))
+            single_arrow_count = self.TOTAL_ARROWS - long_arrow_count
 
-        long_arrow_count = max(1, round(self.TOTAL_ARROWS * self.LONG_ARROW_RATIO))
-        single_arrow_count = self.TOTAL_ARROWS - long_arrow_count
+            # 先生成箭头类型列表：长箭头的身体为 2 或 3 格
+            arrow_specs = [rng.choice([2, 3]) for _ in range(long_arrow_count)]
+            arrow_specs.extend([0] * single_arrow_count)
+            rng.shuffle(arrow_specs)
 
-        # 先放置长箭头，避免它们与后续箭头争抢同一片连续格子
-        for _ in range(long_arrow_count):
-            self.place_long_arrow(board, empty_cells, rng)
+            placed_all = True
+            for body_count in arrow_specs:
+                if not self.try_place_arrow(board, empty_cells, body_count, rng):
+                    placed_all = False
+                    break
 
-        # 再放置普通单格箭头
-        for _ in range(single_arrow_count):
-            self.place_single_arrow(board, empty_cells, rng)
+            if placed_all:
+                return board
 
-        return board
+        raise RuntimeError("无法生成可通关的关卡")
 
-    def place_long_arrow(self, board, empty_cells, rng):
-        """在棋盘上放置一个长箭头，并更新空格集合。"""
-        direction = rng.choice([1, 2, 3, 4])
-        # 身体长条占 2 或 3 个格子，再加上 1 个三角形头部
-        body_count = rng.choice([2, 3])
+    def try_place_arrow(self, board, empty_cells, body_count, rng):
+        """尝试放置一个不会导致关卡无法通关的箭头。"""
         total_length = body_count + 1
+        directions = [1, 2, 3, 4]
+        candidates = list(empty_cells)
+        rng.shuffle(directions)
+        rng.shuffle(candidates)
 
+        for direction in directions:
+            dr, dc = self.DIRECTIONS[direction]
+
+            for start_row, start_col in candidates:
+                cells = []
+                valid = True
+
+                # 检查箭头自身占用的格子是否全部在棋盘内且尚未被占用
+                for index in range(total_length):
+                    cell_row = start_row + dr * index
+                    cell_col = start_col + dc * index
+                    if not (
+                        0 <= cell_row < self.BOARD_SIZE
+                        and 0 <= cell_col < self.BOARD_SIZE
+                        and (cell_row, cell_col) in empty_cells
+                    ):
+                        valid = False
+                        break
+                    cells.append((cell_row, cell_col))
+
+                if not valid:
+                    continue
+
+                # 头部格子前方必须通畅，保证该箭头可以被后放置先消除
+                head_row, head_col = cells[-1]
+                if not self.is_path_clear(board, head_row, head_col, direction):
+                    continue
+
+                # 尾部后方不能紧挨同方向箭头，否则会被合并成同一个箭头组
+                behind_row = cells[0][0] - dr
+                behind_col = cells[0][1] - dc
+                if (
+                    0 <= behind_row < self.BOARD_SIZE
+                    and 0 <= behind_col < self.BOARD_SIZE
+                    and board[behind_row][behind_col] == direction
+                ):
+                    continue
+
+                # 确认无误后写入箭头并更新空格集合
+                for cell_row, cell_col in cells:
+                    board[cell_row][cell_col] = direction
+                    empty_cells.discard((cell_row, cell_col))
+                return True
+
+        return False
+
+    def is_path_clear(self, board, row, col, direction):
+        """检查从指定格子前方到棋盘边界是否存在其他箭头。"""
         dr, dc = self.DIRECTIONS[direction]
-        valid_starts = []
+        check_row = row + dr
+        check_col = col + dc
 
-        # 找出所有能完整容纳该长箭头的起点
-        for row, col in empty_cells:
-            cells = [
-                (row + dr * index, col + dc * index)
-                for index in range(total_length)
-            ]
-            if all(
-                0 <= cell_row < self.BOARD_SIZE
-                and 0 <= cell_col < self.BOARD_SIZE
-                and (cell_row, cell_col) in empty_cells
-                for cell_row, cell_col in cells
-            ):
-                valid_starts.append((row, col))
+        while 0 <= check_row < self.BOARD_SIZE and 0 <= check_col < self.BOARD_SIZE:
+            if board[check_row][check_col] != 0:
+                return False
+            check_row += dr
+            check_col += dc
 
-        if not valid_starts:
-            return
-
-        start_row, start_col = rng.choice(valid_starts)
-
-        # 将长箭头占用的格子全部标记为该方向
-        for index in range(total_length):
-            cell_row = start_row + dr * index
-            cell_col = start_col + dc * index
-            board[cell_row][cell_col] = direction
-            empty_cells.discard((cell_row, cell_col))
-
-    def place_single_arrow(self, board, empty_cells, rng):
-        """在剩余空格中放置一个普通单格箭头。"""
-        if not empty_cells:
-            return
-
-        row, col = rng.choice(tuple(empty_cells))
-        direction = rng.choice([1, 2, 3, 4])
-        board[row][col] = direction
-        empty_cells.discard((row, col))
+        return True
 
     # ------------------------------------------------------------------
     # 显示模式
@@ -222,6 +254,8 @@ class Game:
                 self.handle_settings_events(event)
             elif self.scene == "game":
                 self.handle_game_events(event)
+            elif self.scene in ("win", "lose"):
+                self.handle_result_events(event)
 
     def handle_menu_events(self, event):
         """处理主菜单按钮点击。"""
@@ -261,6 +295,16 @@ class Game:
             self.scene = "menu"
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             self.handle_board_click(event.pos)
+
+    def handle_result_events(self, event):
+        """处理通关或失败界面中的按钮点击。"""
+        if event.type != pygame.MOUSEBUTTONDOWN or event.button != 1:
+            return
+
+        for button in self.build_result_buttons():
+            if button["rect"].collidepoint(event.pos):
+                button["action"]()
+                break
 
     def handle_board_click(self, mouse_pos):
         """根据鼠标点击位置检测箭头，并触发飞出或被阻挡动画。"""
@@ -405,9 +449,9 @@ class Game:
     def action_start_game(self):
         """“开始游戏”按钮的回调。
 
-        点击后进入棋盘渲染场景，展示第 1 关测试数据。
+        点击后重置当前关卡并进入棋盘场景。
         """
-        self.scene = "game"
+        self.reset_game()
 
     def action_open_settings(self):
         """“设置”按钮的回调，进入设置界面。"""
@@ -416,6 +460,53 @@ class Game:
     def action_quit_game(self):
         """“离开游戏”按钮的回调，退出主循环。"""
         self.running = False
+
+    def action_return_lobby(self):
+        """通关或失败界面中“返回大厅”按钮的回调。"""
+        self.scene = "menu"
+
+    def action_restart_game(self):
+        """失败界面中“重新开始”按钮的回调。"""
+        self.reset_game()
+
+    def reset_game(self):
+        """重置当前棋盘、爱心数量和动画状态，并进入游戏场景。"""
+        self.level_data = self.generate_level()
+        self.current_level = 1
+        self.mistakes_left = self.INITIAL_MISTAKES
+        self.remaining_arrows = self.count_arrow_groups(self.level_data)
+        self.flying_animation = None
+        self.shake_animation = None
+        self.scene = "game"
+
+    def build_result_buttons(self):
+        """根据当前结算场景创建通关或失败界面的按钮。"""
+        center_x = self.screen.get_width() // 2
+        button_width = 240
+        button_height = 60
+        gap = 20
+
+        if self.scene == "win":
+            items = (
+                {"label": "返回大厅", "action": self.action_return_lobby},
+            )
+        else:
+            items = (
+                {"label": "重新开始", "action": self.action_restart_game},
+                {"label": "返回大厅", "action": self.action_return_lobby},
+            )
+
+        buttons = []
+        total_height = len(items) * button_height + (len(items) - 1) * gap
+        start_y = self.screen.get_height() // 2 - total_height // 2 + 80
+
+        for index, item in enumerate(items):
+            y = start_y + index * (button_height + gap)
+            rect = pygame.Rect(0, 0, button_width, button_height)
+            rect.center = (center_x, y + button_height // 2)
+            buttons.append({"rect": rect, **item})
+
+        return buttons
 
     # ------------------------------------------------------------------
     # 设置界面控件
@@ -853,18 +944,77 @@ class Game:
         elif self.shake_animation is not None:
             self.draw_shaking_arrow()
 
+    def draw_heart_icon(self, center_x, center_y, size, color, filled):
+        """使用圆形和三角形绘制一个爱心图标。"""
+        radius = size // 4
+        circle_width = 0 if filled else 2
+
+        # 左右两个圆弧构成爱心的上半部分
+        pygame.draw.circle(
+            self.screen,
+            color,
+            (center_x - radius, center_y - 2),
+            radius,
+            circle_width,
+        )
+        pygame.draw.circle(
+            self.screen,
+            color,
+            (center_x + radius, center_y - 2),
+            radius,
+            circle_width,
+        )
+
+        # 下方三角形构成爱心尖角
+        points = (
+            (center_x - size // 2, center_y - 2),
+            (center_x + size // 2, center_y - 2),
+            (center_x, center_y + size // 2 + 2),
+        )
+        pygame.draw.polygon(self.screen, color, points, circle_width)
+
+    def draw_hearts(self, x, y):
+        """在 HUD 中绘制剩余机会的爱心图标。"""
+        size = 24
+        spacing = size + 8
+        center_y = y + size // 2
+
+        for index in range(self.INITIAL_MISTAKES):
+            center_x = x + index * spacing + size // 2
+            if index < self.mistakes_left:
+                self.draw_heart_icon(
+                    center_x,
+                    center_y,
+                    size,
+                    self.HEART_COLOR,
+                    filled=True,
+                )
+            else:
+                self.draw_heart_icon(
+                    center_x,
+                    center_y,
+                    size,
+                    self.HEART_EMPTY_COLOR,
+                    filled=False,
+                )
+
     def draw_hud(self):
-        """在左上角显示当前关卡、剩余箭头数和剩余失误次数。"""
+        """在左上角显示当前关卡、剩余箭头数和爱心图标。"""
+        x, y = 20, 18
+
         lines = (
             f"当前关卡：{self.current_level}",
             f"剩余箭头：{self.remaining_arrows}",
-            f"剩余失误：{self.mistakes_left}",
         )
-        x, y = 20, 18
         for line in lines:
             text_surface = self.subtitle_font.render(line, True, self.TEXT_COLOR)
             self.screen.blit(text_surface, (x, y))
             y += 30
+
+        # 第三行显示“剩余机会”和对应数量的爱心
+        label_surface = self.subtitle_font.render("剩余机会：", True, self.TEXT_COLOR)
+        self.screen.blit(label_surface, (x, y))
+        self.draw_hearts(x + label_surface.get_width() + 8, y)
 
     # ------------------------------------------------------------------
     # 场景绘制
@@ -908,8 +1058,40 @@ class Game:
         pygame.draw.rect(self.screen, self.BUTTON_BORDER_COLOR, back_rect, width=2, border_radius=12)
         self.draw_text(self.screen, self.button_font, "返回主菜单", self.BUTTON_TEXT_COLOR, back_rect.center)
 
+    def draw_result_button(self, button):
+        """绘制通关或失败界面中的普通文字按钮。"""
+        rect = button["rect"]
+        mouse_pos = pygame.mouse.get_pos()
+        hovered = rect.collidepoint(mouse_pos)
+
+        background = self.BUTTON_HOVER_COLOR if hovered else self.BUTTON_COLOR
+        pygame.draw.rect(self.screen, background, rect, border_radius=14)
+        pygame.draw.rect(self.screen, self.BUTTON_BORDER_COLOR, rect, width=2, border_radius=14)
+        self.draw_text(self.screen, self.button_font, button["label"], self.BUTTON_TEXT_COLOR, rect.center)
+
+    def draw_result_screen(self, title, subtitle, title_color):
+        """绘制通关或失败界面共用的布局。"""
+        self.screen.fill(self.BG_COLOR)
+
+        title_center = (self.screen.get_width() // 2, 160)
+        self.draw_text(self.screen, self.title_font, title, title_color, title_center)
+
+        subtitle_center = (self.screen.get_width() // 2, 230)
+        self.draw_text(self.screen, self.subtitle_font, subtitle, self.MUTED_COLOR, subtitle_center)
+
+        for button in self.build_result_buttons():
+            self.draw_result_button(button)
+
+    def draw_win_screen(self):
+        """绘制通关界面。"""
+        self.draw_result_screen("通关！", "所有箭头已成功清除", (130, 235, 150))
+
+    def draw_lose_screen(self):
+        """绘制失败界面。"""
+        self.draw_result_screen("失败", "剩余机会已用完", self.ICON_X_COLOR)
+
     def draw_game(self):
-        """绘制棋盘场景，展示第 1 关的测试箭头数据。"""
+        """绘制棋盘场景，显示 HUD、棋盘和当前动画。"""
         self.screen.fill(self.BG_COLOR)
         self.draw_hud()
 
@@ -932,6 +1114,10 @@ class Game:
             self.draw_settings()
         elif self.scene == "game":
             self.draw_game()
+        elif self.scene == "win":
+            self.draw_win_screen()
+        elif self.scene == "lose":
+            self.draw_lose_screen()
 
         pygame.display.flip()
 
@@ -950,6 +1136,9 @@ class Game:
             self.remaining_arrows = max(0, self.remaining_arrows - 1)
             self.flying_animation = None
 
+            if self.remaining_arrows == 0 and self.scene == "game":
+                self.scene = "win"
+
     def update_shake_animation(self, dt):
         """推进被阻挡时的晃动动画，结束后恢复箭头颜色。"""
         animation = self.shake_animation
@@ -957,6 +1146,8 @@ class Game:
 
         if animation["elapsed"] >= animation["duration"]:
             self.shake_animation = None
+            if self.mistakes_left <= 0 and self.scene == "game":
+                self.scene = "lose"
 
     def update(self, dt):
         """更新动画状态。"""
