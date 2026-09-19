@@ -39,7 +39,7 @@ class Game:
     LEVELS = {
         1: {"size": 9, "cell_size": 40, "total_arrows": 20},
         2: {"size": 11, "cell_size": 36, "total_arrows": 30},
-        3: {"size": 13, "cell_size": 32, "total_arrows": 42},
+        3: {"size": 13, "cell_size": 32, "total_arrows": 34},
     }
 
     # 箭头总数，以及其中使用 2-3 个正方形组成的长箭头占比
@@ -164,7 +164,7 @@ class Game:
         for attempt in range(200):
             rng = random.Random(20260919 + self.current_level * 100 + attempt)
             arrows, grid = self.try_build_snake_level(rng)
-            if arrows is not None:
+            if arrows is not None and self.has_snake_solution(arrows, grid):
                 self.snake_grid = grid
                 return arrows
         raise RuntimeError("无法生成可弯折箭头关卡")
@@ -180,35 +180,68 @@ class Game:
         single_count = self.TOTAL_ARROWS - multi_count
         one_bend_count = round(multi_count * 0.80)
         multi_bend_count = multi_count - one_bend_count
+        single_attempts = 300 if size >= 13 else 150
+        one_bend_attempts = 500 if size >= 13 else 250
+        multi_bend_attempts = 700 if size >= 13 else 350
 
         # 单格箭头
         for _ in range(single_count):
-            if len(occupied) >= size * size:
+            placed = False
+            for _ in range(single_attempts):
+                empty_cells = [
+                    (row, col)
+                    for row in range(size)
+                    for col in range(size)
+                    if (row, col) not in occupied
+                ]
+                if not empty_cells:
+                    return None, None
+
+                row, col = rng.choice(empty_cells)
+                direction = rng.choice([1, 2, 3, 4])
+                candidate = {"cells": [(row, col)], "direction": direction}
+
+                if self.is_snake_arrow_path_clear(candidate, grid):
+                    self.commit_snake_arrow(candidate, occupied, grid, arrows)
+                    placed = True
+                    break
+
+            if not placed:
                 return None, None
-            row, col = rng.choice(tuple(set(
-                (r, c)
-                for r in range(size)
-                for c in range(size)
-                if (r, c) not in occupied
-            )))
-            direction = rng.choice([1, 2, 3, 4])
-            occupied.add((row, col))
-            grid[row][col] = len(arrows) + 1
-            arrows.append({"cells": [(row, col)], "direction": direction})
 
         # 一次弯折的多格箭头
         for _ in range(one_bend_count):
-            path = self.generate_bent_path(occupied, rng, min_bends=1, max_bends=1)
-            if path is None:
+            placed = False
+            for _ in range(one_bend_attempts):
+                path = self.generate_bent_path(occupied, rng, min_bends=1, max_bends=1)
+                if path is None:
+                    continue
+
+                candidate = self.make_snake_arrow_candidate(path)
+                if self.is_snake_arrow_path_clear(candidate, grid):
+                    self.commit_snake_arrow(candidate, occupied, grid, arrows)
+                    placed = True
+                    break
+
+            if not placed:
                 return None, None
-            self.register_snake_arrow(path, occupied, grid, arrows)
 
         # 二次及以上弯折的多格箭头
         for _ in range(multi_bend_count):
-            path = self.generate_bent_path(occupied, rng, min_bends=2, max_bends=5)
-            if path is None:
+            placed = False
+            for _ in range(multi_bend_attempts):
+                path = self.generate_bent_path(occupied, rng, min_bends=2, max_bends=5)
+                if path is None:
+                    continue
+
+                candidate = self.make_snake_arrow_candidate(path)
+                if self.is_snake_arrow_path_clear(candidate, grid):
+                    self.commit_snake_arrow(candidate, occupied, grid, arrows)
+                    placed = True
+                    break
+
+            if not placed:
                 return None, None
-            self.register_snake_arrow(path, occupied, grid, arrows)
 
         return arrows, grid
 
@@ -228,10 +261,28 @@ class Game:
 
         arrows.append({"cells": cells, "direction": direction})
 
+    def make_snake_arrow_candidate(self, tail_to_head_path):
+        """根据路径创建候选箭头字典，不修改任何网格。"""
+        cells = list(reversed(tail_to_head_path))
+        if len(cells) == 1:
+            direction = 1
+        else:
+            direction = self.direction_between(cells[1], cells[0])
+        return {"cells": cells, "direction": direction}
+
+    def commit_snake_arrow(self, arrow, occupied, grid, arrows):
+        """把通过路径检测的候选箭头正式写入占用数据。"""
+        arrow_id = len(arrows) + 1
+        for row, col in arrow["cells"]:
+            occupied.add((row, col))
+            grid[row][col] = arrow_id
+        arrows.append(arrow)
+
     def generate_bent_path(self, occupied, rng, min_bends, max_bends):
         """随机生成一条长度至少为 3 且满足弯折次数要求的路径。"""
         size = self.BOARD_SIZE
-        for _ in range(800):
+        path_attempts = 300 if size >= 13 else 150
+        for _ in range(path_attempts):
             empty_cells = [
                 (row, col)
                 for row in range(size)
@@ -632,18 +683,51 @@ class Game:
         一路到棋盘外都没有障碍，才返回 True。
         """
         arrow = self.arrows[arrow_index]
+        return self.is_snake_arrow_path_clear(arrow, self.snake_grid)
+
+    def is_snake_arrow_path_clear(self, arrow, grid):
+        """只读判断一个蛇形箭头前方路径是否完全没有阻挡。"""
         direction = arrow["direction"]
         dr, dc = self.DIRECTIONS[direction]
-
         head_row, head_col = arrow["cells"][0]
         check_row = head_row + dr
         check_col = head_col + dc
 
         while 0 <= check_row < self.BOARD_SIZE and 0 <= check_col < self.BOARD_SIZE:
-            if self.snake_grid[check_row][check_col] != 0:
+            if grid[check_row][check_col] != 0:
                 return False
             check_row += dr
             check_col += dc
+
+        return True
+
+    def has_snake_solution(self, arrows, grid):
+        """检测一组蛇形箭头是否存在一个可以全部消除的点击顺序。"""
+        arrows_copy = [
+            {"cells": list(arrow["cells"]), "direction": arrow["direction"]}
+            for arrow in arrows
+        ]
+        grid_copy = [row[:] for row in grid]
+        remaining = len(arrows_copy)
+
+        while remaining > 0:
+            removed_this_round = False
+
+            for arrow in arrows_copy:
+                if not arrow["cells"]:
+                    continue
+
+                if self.is_snake_arrow_path_clear(arrow, grid_copy):
+                    for row, col in arrow["cells"]:
+                        if 0 <= row < self.BOARD_SIZE and 0 <= col < self.BOARD_SIZE:
+                            grid_copy[row][col] = 0
+                    arrow["cells"] = []
+                    remaining -= 1
+                    removed_this_round = True
+                    break
+
+            if not removed_this_round:
+                return False
 
         return True
 
