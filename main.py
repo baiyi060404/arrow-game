@@ -150,7 +150,7 @@ class Game:
         try:
             pygame.mixer.init(22050, -16, 1, 512)
             self.sound_error = self._make_tone(160, 0.12, 0.25)
-            self.sound_success = self._make_tone(880, 0.12, 0.20)
+            self.sound_success = self._make_metal_sound()
             self.sound_ok = True
         except Exception:
             self.sound_ok = False
@@ -168,6 +168,25 @@ class Game:
                 * 32767
             )
             samples.append(value)
+        return pygame.mixer.Sound(buffer=samples.tobytes())
+
+    def _make_metal_sound(self):
+        """生成一个短促、带衰减的醇厚金属音。"""
+        sample_rate = 22050
+        duration = 0.28
+        sample_count = int(sample_rate * duration)
+        samples = array("h")
+
+        for index in range(sample_count):
+            time = index / sample_rate
+            envelope = math.exp(-12.0 * time)
+            value = (
+                math.sin(2 * math.pi * 880 * time) * 0.35
+                + math.sin(2 * math.pi * 1320 * time) * 0.22
+                + math.sin(2 * math.pi * 1760 * time) * 0.12
+            )
+            samples.append(int(value * envelope * 32767))
+
         return pygame.mixer.Sound(buffer=samples.tobytes())
 
     def play_sound(self, sound):
@@ -246,10 +265,13 @@ class Game:
         # 恢复初始第一关状态，避免预生成影响启动界面。
         self.apply_level_config(1)
 
-    def generate_snake_level(self):
+    def generate_snake_level(self, base_seed=None):
         """生成第二、三关使用的可弯折多段箭头。"""
+        if base_seed is None:
+            base_seed = 20260919
+
         for attempt in range(200):
-            rng = random.Random(20260919 + self.current_level * 100 + attempt)
+            rng = random.Random(base_seed + attempt)
             arrows, grid = self.try_build_snake_level(rng)
             if arrows is not None and self.has_snake_solution(arrows, grid):
                 self.snake_grid = grid
@@ -1185,6 +1207,9 @@ class Game:
     def action_next_level(self):
         """通关界面中“下一关”按钮的回调。"""
         if self.current_level < max(self.LEVELS):
+            # 进入新的普通关卡时重置得分和用时，避免上一关得分带入下一关。
+            self.score = 0
+            self.elapsed_time = 0.0
             self.apply_level_config(self.current_level + 1)
             self.scene = "game"
 
@@ -1217,7 +1242,8 @@ class Game:
         self.TOTAL_ARROWS = config["total_arrows"]
         self.use_snake_movement = True
 
-        self.arrows = self.generate_snake_level()
+        # 无尽模式每次通关都必须生成全新的随机地图，因此传入新的随机种子。
+        self.arrows = self.generate_snake_level(base_seed=random.randint(1, 10**9))
         self.level_data = [[0 for _ in range(self.BOARD_SIZE)] for _ in range(self.BOARD_SIZE)]
         self.remaining_arrows = len(self.arrows)
         self.snake_animation = None
@@ -2167,14 +2193,97 @@ class Game:
         for button in self.build_result_buttons():
             self.draw_result_button(button)
 
+    def get_final_score(self):
+        """计算与用时和剩余失误次数相关的最终得分。"""
+        time_bonus = max(0, 1000 - int(self.elapsed_time) * 10)
+        mistake_bonus = self.mistakes_left * 200
+        return self.score + time_bonus + mistake_bonus
+
+    def get_star_count(self):
+        """星级只与剩余失误次数相关，失败时为 0 星。"""
+        if self.scene == "lose":
+            return 0
+        return self.mistakes_left
+
+    def draw_star_icon(self, center_x, center_y, size, color, filled):
+        """绘制一个五角星图标。"""
+        outer_radius = size // 2
+        inner_radius = outer_radius * 0.45
+        points = []
+
+        for index in range(10):
+            radius = outer_radius if index % 2 == 0 else inner_radius
+            angle = math.pi / 2 + index * math.pi / 5
+            points.append(
+                (
+                    center_x + math.cos(angle) * radius,
+                    center_y - math.sin(angle) * radius,
+                )
+            )
+
+        width = 0 if filled else 2
+        pygame.draw.polygon(self.screen, color, points, width)
+
+    def draw_star_rating(self, center_y):
+        """绘制 0-3 颗星的星级评价。"""
+        star_count = self.get_star_count()
+        size = 34
+        spacing = size + 12
+        total_width = 3 * size + 2 * spacing
+        start_x = self.screen.get_width() // 2 - total_width // 2 + size // 2
+
+        for index in range(3):
+            filled = index < star_count
+            color = self.HEART_COLOR if filled else self.HEART_EMPTY_COLOR
+            self.draw_star_icon(
+                start_x + index * spacing,
+                center_y,
+                size,
+                color,
+                filled,
+            )
+
     def draw_win_screen(self):
         """绘制通关界面。"""
-        self.draw_result_screen("通关！", "所有箭头已成功清除", (130, 235, 150))
+        self.screen.fill(self.BG_COLOR)
+
+        title_center = (self.screen.get_width() // 2, 120)
+        self.draw_text(self.screen, self.title_font, "通关！", (130, 235, 150), title_center)
+
+        score_center = (self.screen.get_width() // 2, 185)
+        self.draw_text(
+            self.screen,
+            self.setting_font,
+            f"最终得分：{self.get_final_score()}",
+            self.TEXT_COLOR,
+            score_center,
+        )
+
+        self.draw_star_rating(245)
+
+        for button in self.build_result_buttons():
+            self.draw_result_button(button)
 
     def draw_lose_screen(self):
         """绘制失败界面。"""
-        subtitle = f"剩余机会已用完，得分：{self.score}"
-        self.draw_result_screen("失败", subtitle, self.ICON_X_COLOR)
+        self.screen.fill(self.BG_COLOR)
+
+        title_center = (self.screen.get_width() // 2, 120)
+        self.draw_text(self.screen, self.title_font, "失败", self.ICON_X_COLOR, title_center)
+
+        score_center = (self.screen.get_width() // 2, 185)
+        self.draw_text(
+            self.screen,
+            self.setting_font,
+            f"最终得分：{self.score}",
+            self.TEXT_COLOR,
+            score_center,
+        )
+
+        self.draw_star_rating(245)
+
+        for button in self.build_result_buttons():
+            self.draw_result_button(button)
 
     def draw_level_select(self):
         """绘制选关界面。"""
