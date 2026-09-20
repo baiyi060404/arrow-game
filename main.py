@@ -2090,9 +2090,10 @@ class Game:
     def draw_hud(self):
         """在左上角显示当前关卡、剩余箭头数和爱心图标。"""
         x, y = 20, 12
+        level_label = "无尽模式" if self.endless_mode else f"第 {self.current_level} 关"
 
         lines = (
-            f"当前关卡：{self.current_level}",
+            f"当前关卡：{level_label}",
             f"剩余箭头：{self.remaining_arrows}",
             f"得分：{self.score}",
             f"时间：{int(self.elapsed_time)}s",
@@ -2308,10 +2309,11 @@ class Game:
 
         # 根据棋盘顶部位置放置标题和提示，避免大棋盘遮挡文字
         title_center = (center_x, max(60, board_top - 100))
+        title_text = "无尽模式" if self.endless_mode else f"第 {self.current_level} 关"
         self.draw_text(
             self.screen,
             self.title_font,
-            f"第 {self.current_level} 关",
+            title_text,
             self.TITLE_COLOR,
             title_center,
         )
